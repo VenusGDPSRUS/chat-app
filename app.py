@@ -322,4 +322,6 @@ def delete(d):
 # ===== RUN =====
 public=ngrok.connect(5000)
 print("Chat URL:",public)
-socketio.run(app,port=5000)
+import os
+port = int(os.environ.get("PORT", 5000))
+socketio.run(app, host="0.0.0.0", port=port)
