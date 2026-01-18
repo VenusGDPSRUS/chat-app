@@ -1,3 +1,4 @@
+!pip install flask flask-socketio pyngrok werkzeug
 from flask import Flask, request, redirect, session, send_from_directory, render_template_string
 from flask_socketio import SocketIO, emit
 from werkzeug.security import generate_password_hash, check_password_hash
@@ -325,3 +326,4 @@ print("Chat URL:",public)
 import os
 port = int(os.environ.get("PORT", 5000))
 socketio.run(app, host="0.0.0.0", port=port)
+
