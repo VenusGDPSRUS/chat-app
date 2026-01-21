@@ -188,7 +188,78 @@ def chat():
         return redirect("/")
 
     u=session["user"]
-    return render_template_string("CHAT_HTML_HERE", user=u, theme=users[u]["theme"])
+return render_template_string("""
+<!DOCTYPE html>
+<html>
+<head>
+<script src="https://cdn.socket.io/4.5.4/socket.io.min.js"></script>
+<style>
+body{font-family:Courier New}
+.dark{background:#111;color:white}
+.light{background:#eee;color:black}
+.matrix{background:black;color:#0f0}
+.ocean{background:#002;color:#0ff}
+.sunset{background:#300;color:#ff9}
+.neon{background:#000;color:#f0f}
+.retro{background:#210;color:#fc0}
+.dracula{background:#2b2b2b;color:#ff79c6}
+
+#chat{height:300px;overflow-y:scroll;border:1px solid #555;padding:5px}
+.avatar{width:25px;border-radius:50%}
+.username{font-size:11px;opacity:0.7}
+.mention{font-weight:bold;color:#4da6ff}
+</style>
+</head>
+
+<body class="{{theme}}">
+<h3>{{user}}</h3>
+<a href="/settings">Settings</a> | <a href="/logout">Logout</a>
+
+<div id="chat"></div>
+
+<input id="msg" onkeydown="if(event.key==='Enter')send()">
+<button onclick="send()">Send</button>
+
+<script>
+const socket=io();
+
+function msgHTML(m){
+  let del=m.can_delete?`<button onclick="del('${m.id}')">🗑</button>`:"";
+  return `<div id="m${m.id}">
+    [${m.time}] <img class="avatar" src="/avatars/${m.avatar}">
+    <b>${m.name}</b><div class="username">@${m.username}</div>
+    ${m.msg} ${del}
+  </div>`;
+}
+
+socket.on("history",d=>{
+  chat.innerHTML="";
+  d.forEach(m=>chat.innerHTML+=msgHTML(m));
+});
+
+socket.on("message",m=>{
+  chat.innerHTML+=msgHTML(m);
+});
+
+socket.on("delete",d=>{
+  document.getElementById("m"+d.id).innerHTML="(deleted)";
+});
+
+function send(){
+  let t=msg.value.trim();
+  if(!t) return;
+  socket.emit("message",{msg:t});
+  msg.value="";
+}
+
+function del(id){
+  socket.emit("delete",{id:id});
+}
+</script>
+</body>
+</html>
+""", user=u, theme=users[u]["theme"])
+
 
 @app.route("/avatars/<f>")
 def avatar(f):
@@ -267,3 +338,4 @@ def delete(d):
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     socketio.run(app, host="0.0.0.0", port=port)
+
