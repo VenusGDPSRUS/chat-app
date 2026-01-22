@@ -1,5 +1,4 @@
-flask
-flask-socketio
-eventlet
-psycopg2-binary
-werkzeug
+flask==3.0.0
+flask-socketio==5.3.6
+psycopg2-binary==2.9.9
+werkzeug==3.0.1
