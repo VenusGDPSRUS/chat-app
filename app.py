@@ -17,6 +17,7 @@ os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
 USERS_FILE = "users.json"
 HISTORY_FILE = "chat_history.json"
+USER_STATS_FILE = "user_stats.json"
 
 moderators = {"mahjong", "Admin123", "trollface69", "coaldev"}
 
@@ -29,7 +30,6 @@ def load_users():
     fixed = {}
 
     for nick, u in data.items():
-        # ❌ если старая версия аккаунта — пропускаем
         if not all(k in u for k in ("password", "username", "theme", "timezone", "avatar")):
             continue
         fixed[nick] = u
@@ -41,12 +41,104 @@ def load_history():
         return json.load(open(HISTORY_FILE, "r", encoding="utf-8"))
     return []
 
+def load_user_stats():
+    if os.path.exists(USER_STATS_FILE):
+        return json.load(open(USER_STATS_FILE, "r", encoding="utf-8"))
+    return {}
+
 users = load_users()
 history = load_history()
+user_stats = load_user_stats()
 
 def save():
     json.dump(users, open(USERS_FILE,"w",encoding="utf-8"), ensure_ascii=False, indent=2)
     json.dump(history, open(HISTORY_FILE,"w",encoding="utf-8"), ensure_ascii=False, indent=2)
+    json.dump(user_stats, open(USER_STATS_FILE,"w",encoding="utf-8"), ensure_ascii=False, indent=2)
+
+# ================= USER STATS FUNCTIONS =================
+def update_user_stats(nickname):
+    """Initialize or update user statistics"""
+    if nickname not in user_stats:
+        user_stats[nickname] = {
+            "message_count": 0,
+            "ban_count": 0,
+            "first_message_time": None,
+            "last_message_time": None
+        }
+    return user_stats[nickname]
+
+def get_user_tags(nickname):
+    """Calculate tags for a user based on their stats"""
+    if nickname not in user_stats:
+        return []
+    
+    stats = user_stats[nickname]
+    tags = []
+    
+    # Message count tags
+    msg_count = stats["message_count"]
+    if msg_count >= 6000:
+        tags.append(("[Brother]", ""))
+    elif msg_count >= 5000:
+        tags.append(("[Friend]", ""))
+    elif msg_count >= 3500:
+        tags.append(("[Cousin]", ""))
+    elif msg_count >= 2000:
+        tags.append(("[Neighbor]", ""))
+    elif msg_count >= 500:
+        tags.append(("[Roulette]", ""))
+    elif msg_count >= 250:
+        tags.append(("[Worker]", ""))
+    elif msg_count >= 50:
+        tags.append(("[Stranger]", ""))
+    
+    # Ban count tags
+    ban_count = stats["ban_count"]
+    if ban_count >= 3:
+        tags.append(("[Dangerous]", ""))
+    elif ban_count >= 2:
+        tags.append(("[Shell]", "#c7a15b"))  # Special color for Shell tag
+    elif ban_count >= 1:
+        tags.append(("[Crowded]", ""))
+    
+    # Time-based tags
+    if stats["first_message_time"]:
+        first_msg_time = datetime.fromisoformat(stats["first_message_time"])
+        time_since_first = datetime.utcnow() - first_msg_time
+        days = time_since_first.days
+        hours = time_since_first.seconds // 3600
+        
+        if days >= 365:
+            tags.append(("[Hydrogen]", ""))
+        elif days >= 100:
+            tags.append(("[Petrol]", ""))
+        elif days >= 30:
+            tags.append(("[Diesel]", ""))
+        elif days >= 14:
+            tags.append(("[Steam]", ""))
+        elif days >= 5:
+            tags.append(("[Oil]", ""))
+        elif days >= 2 or (days == 1 and hours >= 12):
+            tags.append(("[Coal]", ""))
+        elif hours >= 12:
+            tags.append(("[Biomass]", ""))
+    
+    return tags
+
+def increment_message_count(nickname):
+    """Increment message count and update timestamps"""
+    stats = update_user_stats(nickname)
+    stats["message_count"] += 1
+    stats["last_message_time"] = datetime.utcnow().isoformat()
+    if not stats["first_message_time"]:
+        stats["first_message_time"] = stats["last_message_time"]
+    save()
+
+def increment_ban_count(nickname):
+    """Increment ban count for a user"""
+    stats = update_user_stats(nickname)
+    stats["ban_count"] += 1
+    save()
 
 # ================= HELPERS =================
 def format_time(iso, tz):
@@ -63,6 +155,20 @@ def highlight_mentions(text):
             text
         )
     return text
+
+def format_tags_html(tags):
+    """Format tags as HTML spans with inline styles"""
+    if not tags:
+        return ""
+    
+    html_tags = []
+    for tag, color in tags:
+        if color:
+            html_tags.append(f'<span class="user-tag" style="color:{color}">{tag}</span>')
+        else:
+            html_tags.append(f'<span class="user-tag">{tag}</span>')
+    
+    return " ".join(html_tags)
 
 # ================= AUTH =================
 @app.route("/", methods=["GET","POST"])
@@ -110,7 +216,11 @@ def register():
             "timezone": "UTC",
             "last_nick": None
         }
+        
+        # Initialize user stats
+        update_user_stats(nick)
         save()
+        
         session["user"] = nick
         return redirect("/chat")
 
@@ -170,6 +280,18 @@ def settings():
     <br><a href="/chat">Back</a>
     """
 
+# ================= ADMIN BAN ENDPOINT =================
+@app.route("/admin/ban/<nickname>", methods=["POST"])
+def ban_user(nickname):
+    """Endpoint for moderators to ban users (increment ban count)"""
+    if "user" not in session or session["user"] not in moderators:
+        return "Unauthorized", 403
+    
+    if nickname in users:
+        increment_ban_count(nickname)
+        return f"User {nickname} ban count incremented"
+    return "User not found", 404
+
 # ================= CHAT =================
 @app.route("/chat")
 def chat():
@@ -201,6 +323,11 @@ def on_connect():
         m2["time"] = format_time(m["raw"], tz)
         m2["can_delete"] = (m["name"] == me)
         m2["is_admin"] = (m["name"] in moderators)
+        
+        # Add tags to message
+        tags = get_user_tags(m["name"])
+        m2["tags_html"] = format_tags_html(tags)
+        
         out.append(m2)
 
     emit("history", out)
@@ -210,6 +337,9 @@ def on_msg(data):
     me = session["user"]
     now = datetime.utcnow()
 
+    # Increment message count for user
+    increment_message_count(me)
+    
     m = {
         "id": str(uuid.uuid4()),
         "name": me,
@@ -225,6 +355,10 @@ def on_msg(data):
     m["time"] = format_time(m["raw"], users[me]["timezone"])
     m["can_delete"] = True
     m["is_admin"] = (me in moderators)
+    
+    # Add tags to message
+    tags = get_user_tags(me)
+    m["tags_html"] = format_tags_html(tags)
 
     emit("message", m, broadcast=True)
 
@@ -263,6 +397,7 @@ body{margin:0;font-family:Courier New}
 .avatar{width:36px;height:36px;border-radius:50%}
 .header{display:flex;gap:6px;align-items:baseline;flex-wrap:wrap}
 .username{font-size:11px;opacity:.6}
+.user-tag{font-size:11px;opacity:0.8;margin-right:4px;}
 .delete{background:none;border:none;cursor:pointer;opacity:.5}
 .delete:hover{opacity:1}
 .mention{color:#4da6ff;font-weight:bold}
@@ -287,7 +422,11 @@ function html(m){
   <div class="time">${m.time.replace(" ","<br>")}</div>
   <img class="avatar" src="/avatars/${m.avatar}">
   <div>
-   <div class="header"><b>${m.name}</b><span class="username">@${m.username}</span></div>
+   <div class="header">
+    <b>${m.name}</b>
+    ${m.tags_html}
+    <span class="username">@${m.username}</span>
+   </div>
    <div>${m.msg}</div>
   </div>
   ${m.can_delete?`<button class="delete" onclick="del('${m.id}')">✕</button>`:""}
