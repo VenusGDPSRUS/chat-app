@@ -387,7 +387,7 @@ body{margin:0;font-family:Courier New}
 .sunset{background:#300;color:#ff9}
 .neon{background:#000;color:#f0f}
 .dracula{background:#282a36;color:#f8f8f2}
-.crowdcontrol{background:#112336;color:#1c4975}
+.crowdcontrol{background:#0ff;color:#002}
 .aero{background:#80f6ff;color:#003b44}
 .candy{background:#ff80b3;color:#4a001f}
 
