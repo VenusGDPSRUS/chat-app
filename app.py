@@ -182,11 +182,11 @@ def login():
         return "Wrong login"
     return """
     <h2>Login</h2>
-    <form method="POST">
-      <input name="nickname" placeholder="Nickname"><br>
-      <input type="password" name="password"><br>
-      <button>Login</button>
-    </form>
+<form method="POST">
+  <input name="nickname" placeholder="Nickname"><br>
+  <input type="password" name="password" placeholder="Password"><br>
+  <button>Login</button>
+</form>
     <a href="/register">Register</a>
     """
 
@@ -445,3 +445,4 @@ function del(id){socket.emit("delete",{id});}
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     socketio.run(app, host="0.0.0.0", port=port)
+
