@@ -120,9 +120,11 @@ def user_tags(u):
 def login():
     db = get_db()
     if request.method == "POST":
+        ident = request.form["nickname"]
+        
         u = db.execute(
-            "SELECT * FROM users WHERE nickname=?",
-            (request.form["nickname"],)
+         "SELECT * FROM users WHERE nickname=? OR username=?",
+         (ident, ident)
         ).fetchone()
 
         if not u or u["banned"]:
