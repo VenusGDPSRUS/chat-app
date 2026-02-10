@@ -342,7 +342,58 @@ def on_message(d):
 CHAT_HTML = """
 <!doctype html>
 <html>
+CHAT_HTML = """
+<!doctype html>
+<html>
 <head>
+<meta name=viewport content="width=device-width,initial-scale=1">
+<script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
+<link href="https://fonts.googleapis.com/css2?family=PT+Mono&display=swap" rel="stylesheet">
+<style>
+/* Глобальный шрифт PT Mono для всего интерфейса */
+body, h3, a, input, button, .message, #chat {
+    font-family: 'PT Mono', monospace;
+    color: inherit;
+}
+
+/* Основные стили */
+body {
+    margin:0;
+    background:{{bg}};
+}
+.message {
+    display:grid;
+    grid-template-columns:110px 40px 1fr;
+    gap:8px;
+}
+input, button {
+    font-size: 14px;
+    padding: 4px 6px;
+}
+</style>
+</head>
+<body>
+<h3>{{nick}}</h3>
+<a href=/settings>Settings</a> |
+<a href=/logout>Logout</a>
+<div id=chat></div>
+<input id=msg onkeydown="if(event.key=='Enter')send()">
+<button onclick=send()>Send</button>
+<script>
+const s=io({transports:["polling","websocket"]});
+function row(m){
+ return `<div class=message><div>${m.time}</div>
+ <img src=/avatars/${m.avatar} width=32>
+ <div><b>${m.name}</b> @${m.username}<br>${m.msg}</div></div>`;
+}
+s.on("history",d=>{chat.innerHTML="";d.forEach(m=>chat.innerHTML+=row(m));});
+s.on("message",m=>chat.innerHTML+=row(m));
+function send(){if(msg.value.trim())s.emit("message",{msg:msg.value});msg.value="";}
+</script>
+</body>
+</html>
+"""
+
 <meta name=viewport content="width=device-width,initial-scale=1">
 <script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
 <style>
