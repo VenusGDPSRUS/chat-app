@@ -1,6 +1,9 @@
 import os, sqlite3, uuid, re
 from datetime import datetime, timedelta
-from flask import Flask, request, session, redirect, render_template_string, send_from_directory, g
+from flask import (
+    Flask, request, session, redirect,
+    render_template_string, send_from_directory, g
+)
 from flask_socketio import SocketIO, emit
 from werkzeug.security import generate_password_hash, check_password_hash
 
@@ -26,7 +29,14 @@ THEMES = {
 # ================= APP =================
 app = Flask(__name__)
 app.secret_key = os.environ.get("SECRET_KEY", "supersecretkey")
-socketio = SocketIO(app, async_mode="threading", manage_session=True)
+
+socketio = SocketIO(
+    app,
+    async_mode="threading",
+    cors_allowed_origins="*",
+    transports=["polling", "websocket"],
+    manage_session=True
+)
 
 # ================= DB =================
 def get_db():
@@ -109,7 +119,6 @@ def user_tags(u):
 @app.route("/", methods=["GET","POST"])
 def login():
     db = get_db()
-
     if request.method == "POST":
         u = db.execute(
             "SELECT * FROM users WHERE nickname=?",
@@ -131,12 +140,19 @@ def login():
 
         return "Wrong password"
 
-    return """..."""
+    return """
+    <h2>Login</h2>
+    <form method=post>
+    <input name=nickname placeholder=Nickname>
+    <input type=password name=password placeholder=Password>
+    <button>Login</button>
+    </form>
+    <a href=/register>Register</a>
+    """
 
 @app.route("/register", methods=["GET","POST"])
 def register():
     db = get_db()
-
     if request.method == "POST":
         nick = request.form["nickname"]
         uname = request.form["username"]
@@ -147,7 +163,6 @@ def register():
 
         avatar = request.files.get("avatar")
         fname = None
-
         if avatar and avatar.filename:
             fname = f"{uuid.uuid4()}.png"
             avatar.save(os.path.join(AVATARS, fname))
@@ -156,19 +171,152 @@ def register():
             db.execute("""INSERT INTO users
             (nickname,username,password,avatar,theme,timezone,ip,created_at)
             VALUES (?,?,?,?,?,?,?,?)""",
-            (nick, uname, generate_password_hash(pwd), fname,
-             "dark", "UTC", request.remote_addr, now()))
+            (nick, uname, generate_password_hash(pwd),
+             fname, "dark", "UTC", request.remote_addr, now()))
             db.commit()
         except:
             return "Nickname or username exists"
 
         return redirect("/")
 
-    return """..."""
+    return """
+    <h2>Register</h2>
+    <form method=post enctype=multipart/form-data>
+    <input name=nickname placeholder=Nickname>
+    <input name=username placeholder=@username>
+    <input type=password name=password placeholder=Password>
+    <input type=file name=avatar>
+    <button>Register</button>
+    </form>
+    """
 
-# ================= CHAT / SOCKET =================
-# ⬅️ логика чата оставлена без изменений
-# (использует get_db() вместо db())
+# ================= CHAT =================
+@app.route("/chat")
+def chat():
+    if "uid" not in session:
+        return redirect("/")
+    db = get_db()
+    u = db.execute("SELECT * FROM users WHERE id=?", (session["uid"],)).fetchone()
+    bg, fg = THEMES.get(u["theme"], THEMES["dark"])
+    return render_template_string(CHAT_HTML, bg=bg, fg=fg, nick=u["nickname"])
+
+@app.route("/avatars/<f>")
+def avatar(f):
+    return send_from_directory(AVATARS, f)
+
+@app.route("/logout")
+def logout():
+    session.clear()
+    return redirect("/")
+
+# ================= SOCKET =================
+@socketio.on("connect")
+def on_connect():
+    if "uid" not in session:
+        return
+    db = get_db()
+    u = db.execute("SELECT * FROM users WHERE id=?", (session["uid"],)).fetchone()
+
+    rows = db.execute("""
+    SELECT m.id,m.text,m.created_at,u.nickname,u.username,u.avatar
+    FROM messages m JOIN users u ON m.user_id=u.id
+    WHERE m.deleted=0
+    """).fetchall()
+
+    out=[]
+    for r in rows:
+        tags = user_tags(
+            db.execute("SELECT * FROM users WHERE nickname=?", (r["nickname"],)).fetchone()
+        )
+        out.append({
+            "id": r["id"],
+            "name": r["nickname"],
+            "username": r["username"],
+            "avatar": r["avatar"],
+            "time": format_time(r["created_at"], u["timezone"]),
+            "msg": r["text"],
+            "tags": tags
+        })
+    emit("history", out)
+
+@socketio.on("message")
+def on_message(d):
+    db = get_db()
+    uid = session["uid"]
+    u = db.execute("SELECT * FROM users WHERE id=?", (uid,)).fetchone()
+    text = d["msg"].strip()
+
+    if text.startswith("/") and u["nickname"] in MODERATORS:
+        cmd = text.split()
+        if cmd[0]=="/clear":
+            db.execute("DELETE FROM messages")
+        elif cmd[0]=="/ban" and len(cmd)>1:
+            db.execute("UPDATE users SET banned=1,ban_count=ban_count+1 WHERE nickname=?", (cmd[1],))
+        elif cmd[0]=="/unban" and len(cmd)>1:
+            db.execute("UPDATE users SET banned=0 WHERE nickname=?", (cmd[1],))
+        elif cmd[0]=="/ipban" and len(cmd)>1:
+            ip = db.execute("SELECT ip FROM users WHERE nickname=?", (cmd[1],)).fetchone()
+            if ip:
+                db.execute("INSERT OR IGNORE INTO ip_bans VALUES (?)", (ip["ip"],))
+        db.commit()
+        return
+
+    mid = str(uuid.uuid4())
+    db.execute(
+        "INSERT INTO messages VALUES (?,?,?,?,0)",
+        (mid, uid, text, now())
+    )
+    db.commit()
+
+    emit("message",{
+        "id": mid,
+        "name": u["nickname"],
+        "username": u["username"],
+        "avatar": u["avatar"],
+        "time": format_time(now(), u["timezone"]),
+        "msg": text,
+        "tags": user_tags(u)
+    }, broadcast=True)
+
+# ================= HTML =================
+CHAT_HTML = """
+<!doctype html>
+<html>
+<head>
+<meta name=viewport content="width=device-width,initial-scale=1">
+<script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
+<style>
+body{margin:0;background:{{bg}};color:{{fg}};font-family:system-ui}
+.message{display:grid;grid-template-columns:110px 40px 1fr;gap:8px}
+.time{font-size:11px;opacity:.6}
+.avatar{width:32px;height:32px;border-radius:50%}
+.tag{font-size:11px;margin-right:4px}
+.username{font-size:11px;opacity:.6}
+</style>
+</head>
+<body>
+<h3>{{nick}}</h3>
+<a href=/logout>Logout</a>
+<div id=chat></div>
+<input id=msg onkeydown="if(event.key=='Enter')send()">
+<button onclick=send()>Send</button>
+<script>
+const s = io({ transports: ["polling", "websocket"] });
+function row(m){
+ let t=m.tags.map(x=>`<span class=tag style=color:${x[1]}>[${x[0]}]</span>`).join("");
+ return `<div class=message>
+ <div class=time>${m.time.replace(" ","<br>")}</div>
+ <img class=avatar src=/avatars/${m.avatar}>
+ <div><b>${m.name}</b> ${t}<span class=username>@${m.username}</span><br>${m.msg}</div>
+ </div>`;
+}
+s.on("history",d=>{chat.innerHTML="";d.forEach(m=>chat.innerHTML+=row(m));});
+s.on("message",m=>chat.innerHTML+=row(m));
+function send(){if(msg.value.trim())s.emit("message",{msg:msg.value});msg.value="";}
+</script>
+</body>
+</html>
+"""
 
 # ================= RUN =================
 if __name__ == "__main__":
