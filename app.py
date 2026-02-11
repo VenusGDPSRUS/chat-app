@@ -7,8 +7,8 @@ from flask import (
 from flask_socketio import SocketIO, emit
 from werkzeug.security import generate_password_hash, check_password_hash
 from authlib.integrations.flask_client import OAuth
-import psycopg2
-import psycopg2.extras
+import psycopg
+from psycopg.rows import dict_row
 
 # ================= CONFIG =================
 DATABASE_URL = os.environ["DATABASE_URL"]
@@ -49,9 +49,10 @@ oauth.register(
 # ================= DB =================
 def get_db():
     if "db" not in g:
-        g.db = psycopg2.connect(
+        g.db = psycopg.connect(
             DATABASE_URL,
-            cursor_factory=psycopg2.extras.RealDictCursor
+            row_factory=dict_row,
+            autocommit=True
         )
     return g.db
 
