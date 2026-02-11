@@ -63,7 +63,7 @@ def close_db(_):
         db.close()
 
 def init_db():
-    db = psycopg2.connect(DATABASE_URL)
+    db = psycopg.connect(DATABASE_URL)
     c = db.cursor()
     c.execute("""
     CREATE TABLE IF NOT EXISTS users(
