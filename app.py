@@ -20,9 +20,13 @@ THEMES = {
     "light": ("#eee", "#000"),
     "dracula": ("#282a36", "#f8f8f2"),
     "ocean": ("#002", "#0ff"),
-    "crowdcontrol": ("#1c4975", "#e6f0ff"),
+    "crowd_control": ("#1c4975", "#e6f0ff"),
     "aero": ("#80f6ff", "#003b44"),
     "candy": ("#ff80b3", "#4a001f"),
+    "matrix": ("#000", "#209400"),
+    "contrast_dark": ("#000", "#8400ff"),
+    "contrast_light": ("#ffffff", "#cc1623"),
+    "theatre": ("#242424", "#b8000c"),
 }
 
 # ================= APP =================
@@ -95,8 +99,10 @@ def init_db():
 init_db()
 
 # ================= HELPERS =================
+from datetime import datetime, UTC
+
 def now():
-    return datetime.utcnow().isoformat()
+    return datetime.now(UTC).isoformat()
 
 def valid_username(u):
     return re.fullmatch(r"[a-zA-Z0-9_]{3,20}", u)
