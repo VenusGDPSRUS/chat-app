@@ -1,19 +1,53 @@
-import os, uuid, re
-from datetime import datetime, timedelta
-from flask import (
-    Flask, request, session, redirect,
-    render_template_string, send_from_directory, g
-)
-from flask_socketio import SocketIO, emit
-from werkzeug.security import generate_password_hash, check_password_hash
-from authlib.integrations.flask_client import OAuth
+import os
 import psycopg
-from psycopg.rows import dict_row
+from flask import Flask, request, session, redirect
+from flask_socketio import SocketIO, emit
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
-# ================= CONFIG =================
-DATABASE_URL = os.environ["DATABASE_URL"]
+app = Flask(__name__)
+app.secret_key = os.environ.get("SECRET_KEY","dev")
 
-MODERATORS = {"mahjong", "Admin123", "trollface69", "coaldev"}
+socketio = SocketIO(app, async_mode="threading")
+
+DATABASE_URL = os.environ.get("DATABASE_URL")
+
+# ---------- DB ----------
+
+def get_db():
+    return psycopg.connect(DATABASE_URL)
+
+def init_db():
+    db = get_db()
+    c = db.cursor()
+
+    c.execute("""
+    CREATE TABLE IF NOT EXISTS users(
+      id SERIAL PRIMARY KEY,
+      username TEXT UNIQUE,
+      password TEXT,
+      nickname TEXT,
+      avatar TEXT DEFAULT 'a1.png',
+      theme TEXT DEFAULT 'matrix',
+      timezone TEXT DEFAULT 'UTC'
+    )
+    """)
+
+    c.execute("""
+    CREATE TABLE IF NOT EXISTS messages(
+      id SERIAL PRIMARY KEY,
+      user_id INTEGER REFERENCES users(id),
+      content TEXT,
+      created_at TIMESTAMPTZ DEFAULT NOW()
+    )
+    """)
+
+    db.commit()
+    db.close()
+
+init_db()
+
+# ---------- THEMES ----------
 
 THEMES = {
     "dark": ("#111", "#fff"),
@@ -29,477 +63,186 @@ THEMES = {
     "theatre": ("#242424", "#b8000c"),
 }
 
-# ================= APP =================
-app = Flask(__name__)
-app.secret_key = os.environ.get("SECRET_KEY", "dev")
+# ---------- AUTH ----------
 
-socketio = SocketIO(
-    app,
-    async_mode="threading",
-    cors_allowed_origins="*",
-    transports=["polling", "websocket"],
-    manage_session=True
-)
-
-oauth = OAuth(app)
-oauth.register(
-    name="google",
-    client_id=os.environ.get("GOOGLE_CLIENT_ID"),
-    client_secret=os.environ.get("GOOGLE_CLIENT_SECRET"),
-    server_metadata_url="https://accounts.google.com/.well-known/openid-configuration",
-    client_kwargs={"scope": "openid email profile"},
-)
-
-# ================= DB =================
-def get_db():
-    if "db" not in g:
-        g.db = psycopg.connect(
-            DATABASE_URL,
-            row_factory=dict_row,
-            autocommit=True
-        )
-    return g.db
-
-@app.teardown_appcontext
-def close_db(_):
-    db = g.pop("db", None)
-    if db:
-        db.close()
-
-def init_db():
-    db = psycopg.connect(DATABASE_URL)
-    c = db.cursor()
-    c.execute("""
-    CREATE TABLE IF NOT EXISTS users(
-        id SERIAL PRIMARY KEY,
-        nickname TEXT UNIQUE,
-        username TEXT UNIQUE,
-        password TEXT,
-        google_id TEXT UNIQUE,
-        avatar TEXT,
-        theme TEXT,
-        timezone TEXT,
-        ip TEXT,
-        banned BOOLEAN DEFAULT FALSE,
-        ban_count INT DEFAULT 0,
-        created_at TEXT
-    );
-    CREATE TABLE IF NOT EXISTS messages(
-        id UUID PRIMARY KEY,
-        user_id INT REFERENCES users(id),
-        text TEXT,
-        created_at TEXT,
-        deleted BOOLEAN DEFAULT FALSE
-    );
-    CREATE TABLE IF NOT EXISTS ip_bans(ip TEXT PRIMARY KEY);
-    """)
-    db.commit()
-    db.close()
-
-init_db()
-
-# ================= HELPERS =================
-from datetime import datetime, UTC
-
-def now():
-    return datetime.now(UTC).isoformat()
-
-def valid_username(u):
-    return re.fullmatch(r"[a-zA-Z0-9_]{3,20}", u)
-
-def format_time(ts, tz):
-    offsets = {"UTC":0,"UTC-8":-8,"UTC+3":3,"UTC+4":4}
-    d = datetime.fromisoformat(ts) + timedelta(hours=offsets.get(tz,0))
-    return d.strftime("%d/%m/%Y %H:%M:%S")
-
-def user_tags(u):
-    db = get_db()
-    c = db.cursor()
-    c.execute("SELECT COUNT(*) FROM messages WHERE user_id=%s", (u["id"],))
-    cnt = c.fetchone()["count"]
-
-    tags=[]
-    if cnt >= 1000: tags.append(("Neighbor","#aaa"))
-    elif cnt >= 500: tags.append(("Roulette","#6cf"))
-    elif cnt >= 250: tags.append(("Worker","#6f6"))
-    elif cnt >= 50: tags.append(("Stranger","#ccc"))
-
-    if u["ban_count"] >= 2: tags.append(("Shell","#c7a15b"))
-    elif u["ban_count"] >= 1: tags.append(("Crowded","#044569"))
-
-    if u["nickname"] in MODERATORS:
-        tags.append(("Admin","#f55"))
-
-    return tags
-
-# ================= AUTH =================
 @app.route("/", methods=["GET","POST"])
 def login():
-    db = get_db()
-    c = db.cursor()
+    if request.method=="POST":
+        u = request.form["username"]
+        p = request.form["password"]
 
-    if request.method == "POST":
-        ident = request.form["nickname"]
-        c.execute(
-            "SELECT * FROM users WHERE nickname=%s OR username=%s",
-            (ident, ident)
-        )
-        u = c.fetchone()
-
-        if not u or u["banned"]:
-            return "Banned or not found"
-
-        if u["password"] and check_password_hash(u["password"], request.form["password"]):
-            session["uid"] = u["id"]
+        db=get_db(); c=db.cursor()
+        c.execute("SELECT id FROM users WHERE username=%s AND password=%s",(u,p))
+        r=c.fetchone()
+        if r:
+            session["user_id"]=r[0]
             return redirect("/chat")
-
-        return "Wrong password"
-
-    return """
-    <h2>Login</h2>
-    <form method=post>
-      <input name=nickname placeholder="Nickname or username">
-      <input type=password name=password placeholder=Password>
-      <button>Login</button>
-    </form>
-    <a href=/register>Register</a><br><br>
-    <a href=/auth/google>Login with Google</a>
-    """
+    return "<form method=post><input name=username><input name=password type=password><button>Login</button></form><a href=/register>Register</a>"
 
 @app.route("/register", methods=["GET","POST"])
 def register():
-    db = get_db()
-    c = db.cursor()
-
-    if request.method == "POST":
-        nick = request.form["nickname"]
-        uname = request.form["username"]
-        pwd = request.form["password"]
-
-        if not valid_username(uname):
-            return "Invalid username"
-
-        try:
-            c.execute("""
-            INSERT INTO users
-            (nickname,username,password,theme,timezone,ip,created_at)
-            VALUES (%s,%s,%s,%s,%s,%s,%s)
-            """, (
-                nick, uname, generate_password_hash(pwd),
-                "crowdcontrol", "UTC",
-                request.remote_addr, now()
-            ))
-            db.commit()
-        except:
-            return "Nickname or username exists"
-
+    if request.method=="POST":
+        db=get_db(); c=db.cursor()
+        c.execute(
+          "INSERT INTO users(username,password,avatar,nickname) VALUES(%s,%s,%s,%s)",
+          (
+            request.form["username"],
+            request.form["password"],
+            request.form.get("avatar","a1.png"),
+            request.form["username"]
+          )
+        )
+        db.commit()
         return redirect("/")
-
     return """
-    <h2>Register</h2>
+    <body style="background:#000;color:#0f0;font-family:Courier New">
+    <h3>Register</h3>
     <form method=post>
-      <input name=nickname placeholder=Nickname>
-      <input name=username placeholder=Username>
-      <input type=password name=password placeholder=Password>
+      <input name=username placeholder=username><br>
+      <input name=password type=password placeholder=password><br>
+      <input type=hidden name=avatar id=avatar>
+      <img src=/static/avatars/a1.png onclick="pick('a1.png')">
+      <img src=/static/avatars/a2.png onclick="pick('a2.png')">
+      <img src=/static/avatars/a3.png onclick="pick('a3.png')"><br>
       <button>Register</button>
     </form>
+    <script>
+      function pick(a){avatar.value=a;}
+    </script>
     """
-
-# ================= GOOGLE AUTH =================
-@app.route("/auth/google")
-def google_login():
-    return oauth.google.authorize_redirect(
-        os.environ["GOOGLE_REDIRECT_URL"]
-    )
-
-@app.route("/auth/google/callback")
-def google_callback():
-    token = oauth.google.authorize_access_token()
-    info = token["userinfo"]
-
-    db = get_db()
-    c = db.cursor()
-
-    c.execute("SELECT * FROM users WHERE google_id=%s", (info["sub"],))
-    u = c.fetchone()
-
-    if not u:
-        uname = info["email"].split("@")[0]
-        c.execute("""
-        INSERT INTO users
-        (nickname,username,google_id,theme,timezone,ip,created_at)
-        VALUES (%s,%s,%s,%s,%s,%s,%s)
-        """, (
-            info["name"], uname, info["sub"],
-            "crowdcontrol", "UTC",
-            request.remote_addr, now()
-        ))
-        db.commit()
-        c.execute("SELECT * FROM users WHERE google_id=%s", (info["sub"],))
-        u = c.fetchone()
-
-    session["uid"] = u["id"]
-    return redirect("/chat")
-
-# ================= CHAT =================
-@app.route("/chat")
-def chat():
-    if "uid" not in session:
-        return redirect("/")
-    db = get_db()
-    c = db.cursor()
-    c.execute("SELECT * FROM users WHERE id=%s", (session["uid"],))
-    u = c.fetchone()
-    bg, fg = THEMES.get(u["theme"], THEMES["dark"])
-    return render_template_string(CHAT_HTML, bg=bg, fg=fg, nick=u["nickname"])
 
 @app.route("/logout")
 def logout():
     session.clear()
     return redirect("/")
 
-# ================= SOCKET =================
-@socketio.on("connect")
-def on_connect():
-    if "uid" not in session:
-        return
-    db = get_db()
-    c = db.cursor()
-    c.execute("""
-    SELECT m.id,m.text,m.created_at,u.nickname,u.username
-    FROM messages m JOIN users u ON m.user_id=u.id
-    WHERE m.deleted=FALSE
-    ORDER BY m.created_at
-    """)
-    rows = c.fetchall()
+# ---------- CHAT ----------
 
-    out=[]
-    for r in rows:
-        out.append({
-            "id": str(r["id"]),
-            "name": r["nickname"],
-            "username": r["username"],
-            "time": r["created_at"],
-            "msg": r["text"],
-            "tags": []
-        })
-    emit("history", out)
+@app.route("/chat")
+def chat():
+    if "user_id" not in session:
+        return redirect("/")
 
-@socketio.on("message")
-def on_message(d):
-    db = get_db()
-    c = db.cursor()
-    c.execute("SELECT * FROM users WHERE id=%s", (session["uid"],))
-    u = c.fetchone()
+    db=get_db(); c=db.cursor()
+    c.execute("SELECT nickname,avatar,theme,timezone FROM users WHERE id=%s",(session["user_id"],))
+    nick,avatar,theme,tz=c.fetchone()
+    colors=THEMES.get(theme,THEMES["matrix"])
 
-    mid = uuid.uuid4()
-    c.execute(
-        "INSERT INTO messages VALUES (%s,%s,%s,%s,FALSE)",
-        (mid, u["id"], d["msg"], now())
-    )
-    db.commit()
-
-    emit("message",{
-        "id": str(mid),
-        "name": u["nickname"],
-        "username": u["username"],
-        "time": now(),
-        "msg": d["msg"],
-        "tags": []
-    }, broadcast=True)
-
-# ================= HTML =================
-CHAT_HTML = """
+    return f"""
 <!doctype html>
-<html>
-<head>
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
-
-<style>
-:root{
-  --bg: {{bg}};
-  --fg: {{fg}};
-  --panel: rgba(255,255,255,.05);
-  --border: rgba(255,255,255,.15);
-}
-
-*{box-sizing:border-box}
-
-body{
-  margin:0;
-  background:var(--bg);
-  color:var(--fg);
-  font-family:"Courier New", Courier, monospace;
-  height:100vh;
-  display:flex;
-  flex-direction:column;
-}
-
-/* ===== TOP BAR ===== */
-#top{
-  display:flex;
-  align-items:center;
-  justify-content:space-between;
-  padding:10px 14px;
-  background:var(--panel);
-  border-bottom:1px solid var(--border);
-}
-
-#top .left{
-  display:flex;
-  align-items:center;
-  gap:10px;
-}
-
-.avatar{
-  width:32px;
-  height:32px;
-  border-radius:50%;
-  background:#444;
-}
-
-#top button{
-  background:none;
-  border:1px solid var(--border);
-  color:var(--fg);
-  padding:4px 8px;
-  cursor:pointer;
-}
-
-/* ===== CHAT ===== */
-#chat{
-  flex:1;
-  overflow-y:auto;
-  padding:12px;
-}
-
-.message{
-  display:grid;
-  grid-template-columns:40px 1fr;
-  gap:10px;
-  margin-bottom:12px;
-}
-
-.message .avatar{
-  width:40px;
-  height:40px;
-}
-
-.meta{
-  font-size:12px;
-  opacity:.7;
-}
-
-.name{
-  font-weight:bold;
-}
-
-.text{
-  margin-top:2px;
-  white-space:pre-wrap;
-}
-
-/* ===== INPUT ===== */
-#input{
-  display:flex;
-  gap:8px;
-  padding:10px;
-  background:var(--panel);
-  border-top:1px solid var(--border);
-}
-
-#msg{
-  flex:1;
-  background:#000;
-  color:var(--fg);
-  border:1px solid var(--border);
-  padding:8px;
-  font-family:inherit;
-}
-
-#send{
-  padding:8px 16px;
-  background:none;
-  border:1px solid var(--border);
-  color:var(--fg);
-  cursor:pointer;
-}
-</style>
-</head>
-
-<body>
-
-<div id="top">
-  <div class="left">
-    <div class="avatar"></div>
-    <div>{{nick}}</div>
-  </div>
-  <div class="right">
-    <button onclick="location.href='/settings'">Settings</button>
-    <button onclick="location.href='/leaderboard'">Leaderboard</button>
-    <button onclick="location.href='/logout'">Logout</button>
-  </div>
+<body style="margin:0;background:{colors['bg']};color:{colors['fg']};font-family:Courier New">
+<div style="padding:10px;border-bottom:1px solid {colors['fg']}">
+  {nick}
+  <a href=/settings>Settings</a>
+  <a href=/leaderboard>Leaderboard</a>
+  <a href=/logout>Logout</a>
 </div>
 
-<div id="chat"></div>
+<div id=chat style="height:70vh;overflow:auto;padding:10px"></div>
 
-<div id="input">
-  <input id="msg" placeholder="type message…" autocomplete="off"
-         onkeydown="if(event.key==='Enter')send()">
-  <button id="send" onclick="send()">Send</button>
+<div style="display:flex">
+  <input id=msg style="flex:1">
+  <button onclick=send()>Send</button>
 </div>
 
+<script src="https://cdn.socket.io/4.7.2/socket.io.min.js"></script>
 <script>
-const s = io({transports:["polling","websocket"]});
-
-function fmt(t){
-  const d=new Date(t);
-  return d.toLocaleString();
-}
-
-function row(m){
-  return `
-  <div class="message">
-    <div class="avatar"></div>
-    <div>
-      <div class="meta">
-        <span class="name">${m.name}</span>
-        @${m.username} • ${fmt(m.time)}
-      </div>
-      <div class="text">${m.msg}</div>
-    </div>
+let s=io();
+s.on("msg",m=>{
+  chat.innerHTML+=`
+  <div>
+    <img src="/static/avatars/${{m.avatar}}" width=32>
+    <b>${{m.nick}}</b>
+    <small>${{m.time}}</small><br>
+    ${{m.text}}
   </div>`;
-}
-
-s.on("history", d=>{
-  chat.innerHTML="";
-  d.forEach(m=>chat.innerHTML+=row(m));
   chat.scrollTop=chat.scrollHeight;
 });
-
-s.on("message", m=>{
-  chat.innerHTML+=row(m);
-  chat.scrollTop=chat.scrollHeight;
-});
-
 function send(){
-  if(msg.value.trim()){
-    s.emit("message",{msg:msg.value});
-    msg.value="";
-  }
+  s.emit("msg",msg.value);
+  msg.value="";
 }
 </script>
-
 </body>
-</html>
 """
 
-# ================= RUN =================
-if __name__ == "__main__":
-    socketio.run(
-        app,
-        host="0.0.0.0",
-        port=int(os.environ.get("PORT", 5000)),
-        allow_unsafe_werkzeug=True
-    )
+# ---------- SOCKET ----------
+
+@socketio.on("msg")
+def msg(text):
+    db=get_db(); c=db.cursor()
+    c.execute("""
+      SELECT nickname,avatar,theme,timezone
+      FROM users WHERE id=%s
+    """,(session["user_id"],))
+    nick,avatar,theme,tz=c.fetchone()
+
+    c.execute("INSERT INTO messages(user_id,content) VALUES(%s,%s)",(session["user_id"],text))
+    db.commit()
+
+    now=datetime.now(ZoneInfo(tz)).strftime("%H:%M:%S")
+
+    emit("msg",{
+      "nick":nick,
+      "avatar":avatar,
+      "text":text,
+      "time":now
+    },broadcast=True)
+
+# ---------- SETTINGS ----------
+
+@app.route("/settings", methods=["GET","POST"])
+def settings():
+    if "user_id" not in session:
+        return redirect("/")
+    db=get_db(); c=db.cursor()
+    if request.method=="POST":
+        c.execute("""
+        UPDATE users SET nickname=%s,avatar=%s,theme=%s,timezone=%s
+        WHERE id=%s
+        """,(
+          request.form["nickname"],
+          request.form["avatar"],
+          request.form["theme"],
+          request.form["timezone"],
+          session["user_id"]
+        ))
+        db.commit()
+        return redirect("/chat")
+
+    c.execute("SELECT nickname,avatar,theme,timezone FROM users WHERE id=%s",(session["user_id"],))
+    u=c.fetchone()
+
+    return f"""
+    <body style="background:#000;color:#0f0;font-family:Courier New">
+    <h3>Settings</h3>
+    <form method=post>
+      Nick:<input name=nickname value="{u[0]}"><br>
+      Avatar:<input name=avatar value="{u[1]}"><br>
+      Theme:<input name=theme value="{u[2]}"><br>
+      TZ:<input name=timezone value="{u[3]}"><br>
+      <button>Save</button>
+    </form>
+    </body>
+    """
+
+# ---------- LEADERBOARD ----------
+
+@app.route("/leaderboard")
+def leaderboard():
+    db=get_db(); c=db.cursor()
+    c.execute("""
+    SELECT u.username,COUNT(m.id)
+    FROM users u LEFT JOIN messages m ON u.id=m.user_id
+    GROUP BY u.id ORDER BY 2 DESC
+    """)
+    rows=c.fetchall()
+    out="<body style='background:#000;color:#0f0;font-family:Courier New'><h3>Leaderboard</h3>"
+    for u,cnt in rows:
+        out+=f"{u}: {cnt}<br>"
+    return out+"<a href=/chat>back</a></body>"
+
+# ---------- RUN ----------
+
+if __name__=="__main__":
+    socketio.run(app,host="0.0.0.0",port=5000)
