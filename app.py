@@ -313,43 +313,184 @@ CHAT_HTML = """
 <!doctype html>
 <html>
 <head>
-<meta name=viewport content="width=device-width,initial-scale=1">
+<meta name="viewport" content="width=device-width,initial-scale=1">
 <script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
+
 <style>
+:root{
+  --bg: {{bg}};
+  --fg: {{fg}};
+  --panel: rgba(255,255,255,.05);
+  --border: rgba(255,255,255,.15);
+}
+
+*{box-sizing:border-box}
+
 body{
   margin:0;
-  background:{{bg}};
-  color:{{fg}};
-  font-family:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Arial,sans-serif;
+  background:var(--bg);
+  color:var(--fg);
+  font-family:"Courier New", Courier, monospace;
+  height:100vh;
+  display:flex;
+  flex-direction:column;
 }
-#chat{padding:12px}
+
+/* ===== TOP BAR ===== */
+#top{
+  display:flex;
+  align-items:center;
+  justify-content:space-between;
+  padding:10px 14px;
+  background:var(--panel);
+  border-bottom:1px solid var(--border);
+}
+
+#top .left{
+  display:flex;
+  align-items:center;
+  gap:10px;
+}
+
+.avatar{
+  width:32px;
+  height:32px;
+  border-radius:50%;
+  background:#444;
+}
+
+#top button{
+  background:none;
+  border:1px solid var(--border);
+  color:var(--fg);
+  padding:4px 8px;
+  cursor:pointer;
+}
+
+/* ===== CHAT ===== */
+#chat{
+  flex:1;
+  overflow-y:auto;
+  padding:12px;
+}
+
 .message{
   display:grid;
-  grid-template-columns:120px 1fr;
+  grid-template-columns:40px 1fr;
   gap:10px;
-  margin-bottom:8px;
+  margin-bottom:12px;
 }
-.time{font-size:11px;opacity:.7}
-input,button{font-size:14px}
+
+.message .avatar{
+  width:40px;
+  height:40px;
+}
+
+.meta{
+  font-size:12px;
+  opacity:.7;
+}
+
+.name{
+  font-weight:bold;
+}
+
+.text{
+  margin-top:2px;
+  white-space:pre-wrap;
+}
+
+/* ===== INPUT ===== */
+#input{
+  display:flex;
+  gap:8px;
+  padding:10px;
+  background:var(--panel);
+  border-top:1px solid var(--border);
+}
+
+#msg{
+  flex:1;
+  background:#000;
+  color:var(--fg);
+  border:1px solid var(--border);
+  padding:8px;
+  font-family:inherit;
+}
+
+#send{
+  padding:8px 16px;
+  background:none;
+  border:1px solid var(--border);
+  color:var(--fg);
+  cursor:pointer;
+}
 </style>
 </head>
+
 <body>
-<h3 style="padding:10px">{{nick}}</h3>
-<div id=chat></div>
-<input id=msg style="width:80%" onkeydown="if(event.key=='Enter')send()">
-<button onclick=send()>Send</button>
+
+<div id="top">
+  <div class="left">
+    <div class="avatar"></div>
+    <div>{{nick}}</div>
+  </div>
+  <div class="right">
+    <button onclick="location.href='/settings'">Settings</button>
+    <button onclick="location.href='/leaderboard'">Leaderboard</button>
+    <button onclick="location.href='/logout'">Logout</button>
+  </div>
+</div>
+
+<div id="chat"></div>
+
+<div id="input">
+  <input id="msg" placeholder="type message…" autocomplete="off"
+         onkeydown="if(event.key==='Enter')send()">
+  <button id="send" onclick="send()">Send</button>
+</div>
+
 <script>
-const s=io({transports:["polling","websocket"]});
-function row(m){
- return `<div class=message>
- <div class=time>${m.time}</div>
- <div><b>${m.name}</b> @${m.username}<br>${m.msg}</div>
- </div>`;
+const s = io({transports:["polling","websocket"]});
+
+function fmt(t){
+  const d=new Date(t);
+  return d.toLocaleString();
 }
-s.on("history",d=>{chat.innerHTML="";d.forEach(m=>chat.innerHTML+=row(m));});
-s.on("message",m=>chat.innerHTML+=row(m));
-function send(){if(msg.value.trim())s.emit("message",{msg:msg.value});msg.value="";}
+
+function row(m){
+  return `
+  <div class="message">
+    <div class="avatar"></div>
+    <div>
+      <div class="meta">
+        <span class="name">${m.name}</span>
+        @${m.username} • ${fmt(m.time)}
+      </div>
+      <div class="text">${m.msg}</div>
+    </div>
+  </div>`;
+}
+
+s.on("history", d=>{
+  chat.innerHTML="";
+  d.forEach(m=>chat.innerHTML+=row(m));
+  chat.scrollTop=chat.scrollHeight;
+});
+
+s.on("message", m=>{
+  chat.innerHTML+=row(m);
+  chat.scrollTop=chat.scrollHeight;
+});
+
+function send(){
+  if(msg.value.trim()){
+    s.emit("message",{msg:msg.value});
+    msg.value="";
+  }
+}
 </script>
+
 </body>
 </html>
 """
