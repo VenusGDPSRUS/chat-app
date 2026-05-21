@@ -1,21 +1,25 @@
+# app.py
+
 import os
 import psycopg
 from flask import Flask, request, session, redirect
-from flask_socketio import SocketIO, emit
+from flask_socketio import SocketIO, emit, disconnect
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
 app = Flask(__name__)
-app.secret_key = os.environ.get("SECRET_KEY","dev")
+app.secret_key = os.environ.get("SECRET_KEY", "dev")
 
-socketio = SocketIO(app, async_mode="threading")
+# Важно: manage_session=False для корректной работы сессии Flask
+socketio = SocketIO(app, async_mode="threading", manage_session=False)
 
 DATABASE_URL = os.environ.get("DATABASE_URL")
 
 # ---------- DB ----------
 
 def get_db():
-    return psycopg.connect(DATABASE_URL)
+    conn = psycopg.connect(DATABASE_URL)
+    return conn
 
 def init_db():
     db = get_db()
@@ -44,7 +48,6 @@ def init_db():
 
     db.commit()
     db.close()
-
 init_db()
 
 # ---------- THEMES ----------
@@ -76,23 +79,30 @@ def login():
         r=c.fetchone()
         if r:
             session["user_id"]=r[0]
+            db.close()
             return redirect("/chat")
+        db.close()
     return "<form method=post><input name=username><input name=password type=password><button>Login</button></form><a href=/register>Register</a>"
 
 @app.route("/register", methods=["GET","POST"])
 def register():
     if request.method=="POST":
         db=get_db(); c=db.cursor()
-        c.execute(
-          "INSERT INTO users(username,password,avatar,nickname) VALUES(%s,%s,%s,%s)",
-          (
-            request.form["username"],
-            request.form["password"],
-            request.form.get("avatar","a1.png"),
-            request.form["username"]
-          )
-        )
-        db.commit()
+        try:
+            c.execute(
+              "INSERT INTO users(username,password,avatar,nickname) VALUES(%s,%s,%s,%s)",
+              (
+                request.form["username"],
+                request.form["password"],
+                request.form.get("avatar","a1.png"),
+                request.form["username"]
+              )            )
+            db.commit()
+        except psycopg.IntegrityError:
+             # Обработка случая, когда имя пользователя уже существует
+             db.close()
+             return "Username already exists!", 400
+        db.close()
         return redirect("/")
     return """
     <body style="background:#000;color:#0f0;font-family:Courier New">
@@ -116,6 +126,29 @@ def logout():
     session.clear()
     return redirect("/")
 
+# --- Сохранение сессии пользователя для сокета ---
+# Глобальный словарь для хранения user_id по sid сокета
+connected_users = {}
+
+@socketio.on('connect')
+def handle_connect():
+    user_id = session.get('user_id')
+    if user_id is None:
+        print(f"Socket connection rejected: No user_id in session for SID {request.sid}")
+        disconnect() # Отключаем незалогиненного пользователя
+        return False
+    else:
+        connected_users[request.sid] = user_id
+        print(f"User {user_id} connected with SID {request.sid}")
+        # Не эмитим ничего здесь, просто подтверждение подключения сервером
+
+@socketio.on('disconnect')
+def handle_disconnect():
+    sid = request.sid
+    if sid in connected_users:        user_id = connected_users.pop(sid)
+        print(f"User {user_id} disconnected, SID {sid}")
+
+
 # ---------- CHAT ----------
 
 @app.route("/chat")
@@ -127,11 +160,12 @@ def chat():
     c.execute("SELECT nickname,avatar,theme,timezone FROM users WHERE id=%s",(session["user_id"],))
     nick,avatar,theme,tz=c.fetchone()
     colors=THEMES.get(theme,THEMES["matrix"])
+    db.close()
 
     return f"""
 <!doctype html>
-<body style="margin:0;background:{colors['bg']};color:{colors['fg']};font-family:Courier New">
-<div style="padding:10px;border-bottom:1px solid {colors['fg']}">
+<body style="margin:0;background:{colors[0]};color:{colors[1]};font-family:Courier New"> <!-- Исправлено: индексы [0], [1] -->
+<div style="padding:10px;border-bottom:1px solid {colors[1]}">
   {nick}
   <a href=/settings>Settings</a>
   <a href=/leaderboard>Leaderboard</a>
@@ -147,8 +181,11 @@ def chat():
 
 <script src="https://cdn.socket.io/4.7.2/socket.io.min.js"></script>
 <script>
-let s=io();
-s.on("msg",m=>{
+let s=io(); // Подключаемся к текущему домену/порту
+s.on("connect", () => {{
+    console.log("Connected to server via Socket.IO");
+}});
+s.on("msg",m=>{{
   chat.innerHTML+=`
   <div>
     <img src="/static/avatars/${{m.avatar}}" width=32>
@@ -157,37 +194,66 @@ s.on("msg",m=>{
     ${{m.text}}
   </div>`;
   chat.scrollTop=chat.scrollHeight;
-});
-function send(){
-  s.emit("msg",msg.value);
-  msg.value="";
-}
+}});function send(){{
+  const text = msg.value.trim();
+  if (text) {{ // Проверяем, что сообщение не пустое
+    s.emit("msg", text);
+    msg.value=""; // Очищаем после отправки
+  }}
+}}
 </script>
 </body>
 """
 
-# ---------- SOCKET ----------
+# ---------- SOCKET (обработка сообщений) ----------
 
 @socketio.on("msg")
 def msg(text):
-    db=get_db(); c=db.cursor()
-    c.execute("""
-      SELECT nickname,avatar,theme,timezone
-      FROM users WHERE id=%s
-    """,(session["user_id"],))
-    nick,avatar,theme,tz=c.fetchone()
+    # Получаем user_id из глобального словаря, используя SID сокета
+    user_id = connected_users.get(request.sid)
+    if user_id is None:
+        print(f"Message received from unknown SID {request.sid}, ignoring.")
+        return # Или вызвать disconnect(), если хотите жестко отключить
 
-    c.execute("INSERT INTO messages(user_id,content) VALUES(%s,%s)",(session["user_id"],text))
-    db.commit()
+    db = None
+    try:
+        db = get_db()
+        c = db.cursor()
+        # Запрашиваем данные пользователя по user_id из БД
+        c.execute("""
+          SELECT nickname, avatar, theme, timezone
+          FROM users WHERE id=%s
+        """, (user_id,))
+        user_data = c.fetchone()
 
-    now=datetime.now(ZoneInfo(tz)).strftime("%H:%M:%S")
+        if not user_data:
+            print(f"User data not found for ID {user_id}, SID {request.sid}, ignoring message.")
+            return # Или вызвать disconnect()
 
-    emit("msg",{
-      "nick":nick,
-      "avatar":avatar,
-      "text":text,
-      "time":now
-    },broadcast=True)
+        nick, avatar, theme, tz = user_data
+
+        # Вставляем сообщение в БД
+        c.execute("INSERT INTO messages(user_id,content) VALUES(%s,%s)", (user_id, text))
+        db.commit()
+
+        # Форматируем время
+        now = datetime.now(ZoneInfo(tz)).strftime("%H:%M:%S")
+
+        # Отправляем сообщение всем (broadcast=True)
+        emit("msg",{
+          "nick": nick,
+          "avatar": avatar,
+          "text": text,          "time": now
+        }, broadcast=True)
+
+    except Exception as e:
+        print(f"Error processing message for user {user_id}, SID {request.sid}: {e}")
+        # Опционально: эмитить ошибку обратно пользователю
+        # emit("error", {"message": "Failed to send message"})
+    finally:
+        if db:
+            db.close()
+
 
 # ---------- SETTINGS ----------
 
@@ -195,6 +261,7 @@ def msg(text):
 def settings():
     if "user_id" not in session:
         return redirect("/")
+    
     db=get_db(); c=db.cursor()
     if request.method=="POST":
         c.execute("""
@@ -208,10 +275,12 @@ def settings():
           session["user_id"]
         ))
         db.commit()
+        db.close()
         return redirect("/chat")
 
     c.execute("SELECT nickname,avatar,theme,timezone FROM users WHERE id=%s",(session["user_id"],))
     u=c.fetchone()
+    db.close()
 
     return f"""
     <body style="background:#000;color:#0f0;font-family:Courier New">
@@ -223,8 +292,7 @@ def settings():
       TZ:<input name=timezone value="{u[3]}"><br>
       <button>Save</button>
     </form>
-    </body>
-    """
+    </body>    """
 
 # ---------- LEADERBOARD ----------
 
@@ -232,17 +300,21 @@ def settings():
 def leaderboard():
     db=get_db(); c=db.cursor()
     c.execute("""
-    SELECT u.username,COUNT(m.id)
+    SELECT u.username, COUNT(m.id) as msg_count
     FROM users u LEFT JOIN messages m ON u.id=m.user_id
-    GROUP BY u.id ORDER BY 2 DESC
+    GROUP BY u.id ORDER BY msg_count DESC
     """)
     rows=c.fetchall()
+    db.close()
     out="<body style='background:#000;color:#0f0;font-family:Courier New'><h3>Leaderboard</h3>"
-    for u,cnt in rows:
+    for u, cnt in rows:
         out+=f"{u}: {cnt}<br>"
     return out+"<a href=/chat>back</a></body>"
 
 # ---------- RUN ----------
 
 if __name__=="__main__":
-    socketio.run(app,host="0.0.0.0",port=5000)
+    # Убедитесь, что используете порт, предоставленный Railway
+    port = int(os.environ.get("PORT", 5000))
+    print(f"Starting server on port {port}")
+    socketio.run(app, host="0.0.0.0", port=port, debug=False) # debug=False для продакшена
