@@ -1,11 +1,11 @@
 import os
-import time
 import psycopg
-from flask import Flask, request, session, redirect, send_from_directory, url_for
+from flask import Flask, request, session, redirect, send_from_directory, jsonify
 from flask_socketio import SocketIO, emit, disconnect
-from datetime import datetime
-from zoneinfo import ZoneInfo, available_timezones
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 import uuid
+import re
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("SECRET_KEY", "dev")
@@ -28,18 +28,8 @@ DATABASE_URL = os.environ.get("DATABASE_URL")
 def get_db():
     if not DATABASE_URL:
         raise RuntimeError("DATABASE_URL is not set in environment variables")
-    
-    # Попытки подключения с retry, так как БД может запускаться дольше приложения
-    max_retries = 10
-    for i in range(max_retries):
-        try:
-            conn = psycopg.connect(DATABASE_URL)
-            return conn
-        except Exception as e:
-            if i == max_retries - 1:
-                raise e
-            print(f"DB connection attempt {i+1} failed: {e}. Retrying in 2s...")
-            time.sleep(2)
+    conn = psycopg.connect(DATABASE_URL)
+    return conn
 
 def init_db():
     db = get_db()
@@ -51,10 +41,10 @@ def init_db():
       username TEXT UNIQUE,
       password TEXT,
       nickname TEXT,
-      avatar TEXT, -- Теперь может быть пустым, тогда показываем флаг
-      country TEXT DEFAULT 'World',
+      avatar TEXT, 
       theme TEXT DEFAULT 'matrix',
-      timezone TEXT DEFAULT 'UTC'
+      timezone_offset INTEGER DEFAULT 0,
+      country_code TEXT DEFAULT 'US'
     )
     """)
 
@@ -75,16 +65,44 @@ def init_db():
     )
     """)
 
+    # Таблица банов (навсегда)
+    c.execute("""
+    CREATE TABLE IF NOT EXISTS bans(
+      user_id INTEGER PRIMARY KEY REFERENCES users(id),
+      banned_by INTEGER REFERENCES users(id),
+      reason TEXT,
+      created_at TIMESTAMPTZ DEFAULT NOW()
+    )
+    """)
+
+    # Таблица мутов (временно)
+    c.execute("""
+    CREATE TABLE IF NOT EXISTS mutes(
+      user_id INTEGER PRIMARY KEY REFERENCES users(id),
+      muted_by INTEGER REFERENCES users(id),
+      until_time TIMESTAMPTZ,
+      created_at TIMESTAMPTZ DEFAULT NOW()
+    )
+    """)
+
     db.commit()
     db.close()
-    print("Database initialized successfully.")
 
-# Вызываем init_db только если есть DATABASE_URL
+# Попытка подключения к БД с ретраями (так как Railway PG иногда стартует долго)
 if DATABASE_URL:
-    try:
-        init_db()
-    except Exception as e:
-        print(f"Critical Error initializing database: {e}")
+    retry_count = 0
+    while retry_count < 5:
+        try:
+            init_db()
+            print("Database initialized successfully.")
+            break
+        except Exception as e:
+            retry_count += 1
+            print(f"DB connection attempt {retry_count} failed: {e}. Retrying in 2s...")
+            import time
+            time.sleep(2)
+    if retry_count == 5:
+        print("CRITICAL: Could not initialize database after 5 attempts.")
 
 # ---------- THEMES & COUNTRIES ----------
 
@@ -102,52 +120,57 @@ THEMES = {
     "theatre": ("#242424", "#b8000c"),
 }
 
-# Полный список стран для кодов флагов (используем стандартные ISO коды или названия для emoji)
-# Простой маппинг названия -> Emoji флага
-COUNTRY_FLAGS = {
-    "Afghanistan": "🇦🇫", "Albania": "🇦🇱", "Algeria": "🇩🇿", "Andorra": "🇦🇩", "Angola": "🇦🇴",
-    "Antigua and Barbuda": "🇦🇬", "Argentina": "🇦🇷", "Armenia": "🇦🇲", "Australia": "🇦🇺", "Austria": "🇦🇹",
-    "Azerbaijan": "🇦🇿", "Bahamas": "🇧🇸", "Bahrain": "🇧🇭", "Bangladesh": "🇧🇩", "Barbados": "🇧🇧",
-    "Belarus": "🇧🇾", "Belgium": "🇧🇪", "Belize": "🇧🇿", "Benin": "🇧🇯", "Bhutan": "🇧🇹",
-    "Bolivia": "🇧🇴", "Bosnia and Herzegovina": "🇧🇦", "Botswana": "🇧🇼", "Brazil": "🇧🇷", "Brunei": "🇧🇳",
-    "Bulgaria": "🇧🇬", "Burkina Faso": "🇧🇫", "Burundi": "🇧🇮", "Cabo Verde": "🇨🇻", "Cambodia": "🇰🇭",
-    "Cameroon": "🇨🇲", "Canada": "🇨🇦", "Central African Republic": "🇨🇫", "Chad": "🇹🇩", "Chile": "🇨🇱",
-    "China": "🇨🇳", "Colombia": "🇨🇴", "Comoros": "🇰🇲", "Congo (Brazzaville)": "🇨🇬", "Congo (Kinshasa)": "🇨🇩",
-    "Costa Rica": "🇨🇷", "Croatia": "🇭🇷", "Cuba": "🇨🇺", "Cyprus": "🇨🇾", "Czechia": "🇨🇿",
-    "Denmark": "🇩🇰", "Djibouti": "🇩🇯", "Dominica": "🇩🇲", "Dominican Republic": "🇩🇴", "Ecuador": "🇪🇨",
-    "Egypt": "🇪🇬", "El Salvador": "🇸🇻", "Equatorial Guinea": "🇬🇶", "Eritrea": "🇪🇷", "Estonia": "🇪🇪",
-    "Eswatini": "🇸🇿", "Ethiopia": "🇪🇹", "Fiji": "🇫🇯", "Finland": "🇫🇮", "France": "🇫🇷",
-    "Gabon": "🇬🇦", "Gambia": "🇬🇲", "Georgia": "🇬🇪", "Germany": "🇩🇪", "Ghana": "🇬🇭",
-    "Greece": "🇬🇷", "Grenada": "🇬🇩", "Guatemala": "🇬🇹", "Guinea": "🇬🇳", "Guinea-Bissau": "🇬🇼",
-    "Guyana": "🇬🇾", "Haiti": "🇭🇹", "Honduras": "🇭🇳", "Hungary": "🇭🇺", "Iceland": "🇮🇸",
-    "India": "🇮🇳", "Indonesia": "🇮🇩", "Iran": "🇮🇷", "Iraq": "🇮🇶", "Ireland": "🇮🇪",
-    "Israel": "🇮🇱", "Italy": "🇮🇹", "Jamaica": "🇯🇲", "Japan": "🇯🇵", "Jordan": "🇯🇴",
-    "Kazakhstan": "🇰🇿", "Kenya": "🇰🇪", "Kiribati": "🇰🇮", "Kuwait": "🇰🇼", "Kyrgyzstan": "🇰🇬",
-    "Laos": "🇱🇦", "Latvia": "🇱🇻", "Lebanon": "🇱🇧", "Lesotho": "🇱🇸", "Liberia": "🇱🇷",
-    "Libya": "🇱🇾", "Liechtenstein": "🇱🇮", "Lithuania": "🇱🇹", "Luxembourg": "🇱🇺", "Madagascar": "🇲🇬",
-    "Malawi": "🇲🇼", "Malaysia": "🇲🇾", "Maldives": "🇲🇻", "Mali": "🇲🇱", "Malta": "🇲🇹",
-    "Marshall Islands": "🇲🇭", "Mauritania": "🇲🇷", "Mauritius": "🇲🇺", "Mexico": "🇲🇽", "Micronesia": "🇫🇲",
-    "Moldova": "🇲🇩", "Monaco": "🇲🇨", "Mongolia": "🇲🇳", "Montenegro": "🇲🇪", "Morocco": "🇲🇦",
-    "Mozambique": "🇲🇿", "Myanmar": "🇲🇲", "Namibia": "🇳🇦", "Nauru": "🇳🇷", "Nepal": "🇳🇵",
-    "Netherlands": "🇳🇱", "New Zealand": "🇳🇿", "Nicaragua": "🇳🇮", "Niger": "🇳🇪", "Nigeria": "🇳🇬",
-    "North Korea": "🇰🇵", "North Macedonia": "🇲🇰", "Norfolk Island": "🇳🇫", "Norway": "🇳🇴", "Oman": "🇴🇲",
-    "Pakistan": "🇵🇰", "Palau": "🇵🇼", "Palestine": "🇵🇸", "Panama": "🇵🇦", "Papua New Guinea": "🇵🇬",
-    "Paraguay": "🇵🇾", "Peru": "🇵🇪", "Philippines": "🇵🇭", "Poland": "🇵🇱", "Portugal": "🇵🇹",
-    "Qatar": "🇶🇦", "Romania": "🇷🇴", "Russia": "🇷🇺", "Rwanda": "🇷🇼", "Saint Kitts and Nevis": "🇰🇳",
-    "Saint Lucia": "🇱🇨", "Saint Vincent and the Grenadines": "🇻🇨", "Samoa": "🇼🇸", "San Marino": "🇸🇲",
-    "Sao Tome and Principe": "🇸🇹", "Saudi Arabia": "🇸🇦", "Senegal": "🇸🇳", "Serbia": "🇷🇸", "Seychelles": "🇸🇨",
-    "Sierra Leone": "🇸🇱", "Singapore": "🇸🇬", "Slovakia": "🇸🇰", "Slovenia": "🇸🇮", "Solomon Islands": "🇸🇧",
-    "Somalia": "🇸🇴", "South Africa": "🇿🇦", "South Korea": "🇰🇷", "South Sudan": "🇸🇸", "Spain": "🇪🇸",
-    "Sri Lanka": "🇱🇰", "Sudan": "🇸🇩", "Suriname": "🇸🇷", "Sweden": "🇸🇪", "Switzerland": "🇨🇭",
-    "Syria": "🇸🇾", "Tajikistan": "🇹🇯", "Tanzania": "🇹🇿", "Thailand": "🇹🇭", "Timor-Leste": "🇹🇱",
-    "Togo": "🇹🇬", "Tonga": "🇹🇴", "Trinidad and Tobago": "🇹🇹", "Tunisia": "🇹🇳", "Turkey": "🇹🇷",
-    "Turkmenistan": "🇹🇲", "Tuvalu": "🇹🇻", "Uganda": "🇺🇬", "Ukraine": "🇺🇦", "United Arab Emirates": "🇦🇪",
-    "United Kingdom": "🇬🇧", "United States": "🇺🇸", "Uruguay": "🇺🇾", "Uzbekistan": "🇺🇿", "Vanuatu": "🇻🇺",
-    "Vatican City": "🇻🇦", "Venezuela": "🇻🇪", "Vietnam": "🇻🇳", "Yemen": "🇾🇪", "Zambia": "🇿🇲",
-    "Zimbabwe": "🇿🇼", "Antarctica": "🇦🇶"
-}
+# Список стран (код ISO 3166-1 alpha-2 для флагов)
+COUNTRIES = [
+    ("AF", "Afghanistan"), ("AL", "Albania"), ("DZ", "Algeria"), ("AD", "Andorra"), ("AO", "Angola"),
+    ("AG", "Antigua and Barbuda"), ("AR", "Argentina"), ("AM", "Armenia"), ("AU", "Australia"), ("AT", "Austria"),
+    ("AZ", "Azerbaijan"), ("BS", "Bahamas"), ("BH", "Bahrain"), ("BD", "Bangladesh"), ("BB", "Barbados"),
+    ("BY", "Belarus"), ("BE", "Belgium"), ("BZ", "Belize"), ("BJ", "Benin"), ("BT", "Bhutan"),
+    ("BO", "Bolivia"), ("BA", "Bosnia and Herzegovina"), ("BW", "Botswana"), ("BR", "Brazil"), ("BN", "Brunei"),
+    ("BG", "Bulgaria"), ("BF", "Burkina Faso"), ("BI", "Burundi"), ("CV", "Cabo Verde"), ("KH", "Cambodia"),
+    ("CM", "Cameroon"), ("CA", "Canada"), ("CF", "Central African Republic"), ("TD", "Chad"), ("CL", "Chile"),
+    ("CN", "China"), ("CO", "Colombia"), ("KM", "Comoros"), ("CG", "Congo (Brazzaville)"), ("CD", "Congo (Kinshasa)"),
+    ("CR", "Costa Rica"), ("HR", "Croatia"), ("CU", "Cuba"), ("CY", "Cyprus"), ("CZ", "Czechia"),
+    ("DK", "Denmark"), ("DJ", "Djibouti"), ("DM", "Dominica"), ("DO", "Dominican Republic"), ("EC", "Ecuador"),
+    ("EG", "Egypt"), ("SV", "El Salvador"), ("GQ", "Equatorial Guinea"), ("ER", "Eritrea"), ("EE", "Estonia"),
+    ("SZ", "Eswatini"), ("ET", "Ethiopia"), ("FJ", "Fiji"), ("FI", "Finland"), ("FR", "France"),
+    ("GA", "Gabon"), ("GM", "Gambia"), ("GE", "Georgia"), ("DE", "Germany"), ("GH", "Ghana"),
+    ("GR", "Greece"), ("GD", "Grenada"), ("GT", "Guatemala"), ("GN", "Guinea"), ("GW", "Guinea-Bissau"),
+    ("GY", "Guyana"), ("HT", "Haiti"), ("HN", "Honduras"), ("HU", "Hungary"), ("IS", "Iceland"),
+    ("IN", "India"), ("ID", "Indonesia"), ("IR", "Iran"), ("IQ", "Iraq"), ("IE", "Ireland"),
+    ("IL", "Israel"), ("IT", "Italy"), ("JM", "Jamaica"), ("JP", "Japan"), ("JO", "Jordan"),
+    ("KZ", "Kazakhstan"), ("KE", "Kenya"), ("KI", "Kiribati"), ("KW", "Kuwait"), ("KG", "Kyrgyzstan"),
+    ("LA", "Laos"), ("LV", "Latvia"), ("LB", "Lebanon"), ("LS", "Lesotho"), ("LR", "Liberia"),
+    ("LY", "Libya"), ("LI", "Liechtenstein"), ("LT", "Lithuania"), ("LU", "Luxembourg"), ("MG", "Madagascar"),
+    ("MW", "Malawi"), ("MY", "Malaysia"), ("MV", "Maldives"), ("ML", "Mali"), ("MT", "Malta"),
+    ("MH", "Marshall Islands"), ("MR", "Mauritania"), ("MU", "Mauritius"), ("MX", "Mexico"), ("FM", "Micronesia"),
+    ("MD", "Moldova"), ("MC", "Monaco"), ("MN", "Mongolia"), ("ME", "Montenegro"), ("MA", "Morocco"),
+    ("MZ", "Mozambique"), ("MM", "Myanmar"), ("NA", "Namibia"), ("NR", "Nauru"), ("NP", "Nepal"),
+    ("NL", "Netherlands"), ("NZ", "New Zealand"), ("NI", "Nicaragua"), ("NE", "Niger"), ("NG", "Nigeria"),
+    ("KP", "North Korea"), ("MK", "North Macedonia"), ("NF", "Norfolk Island"), ("NO", "Norway"), ("OM", "Oman"),
+    ("PK", "Pakistan"), ("PW", "Palau"), ("PS", "Palestine"), ("PA", "Panama"), ("PG", "Papua New Guinea"),
+    ("PY", "Paraguay"), ("PE", "Peru"), ("PH", "Philippines"), ("PL", "Poland"), ("PT", "Portugal"),
+    ("QA", "Qatar"), ("RO", "Romania"), ("RU", "Russia"), ("RW", "Rwanda"), ("KN", "Saint Kitts and Nevis"),
+    ("LC", "Saint Lucia"), ("VC", "Saint Vincent and the Grenadines"), ("WS", "Samoa"), ("SM", "San Marino"),
+    ("ST", "Sao Tome and Principe"), ("SA", "Saudi Arabia"), ("SN", "Senegal"), ("RS", "Serbia"), ("SC", "Seychelles"),
+    ("SL", "Sierra Leone"), ("SG", "Singapore"), ("SK", "Slovakia"), ("SI", "Slovenia"), ("SB", "Solomon Islands"),
+    ("SO", "Somalia"), ("ZA", "South Africa"), ("KR", "South Korea"), ("SS", "South Sudan"), ("ES", "Spain"),
+    ("LK", "Sri Lanka"), ("SD", "Sudan"), ("SR", "Suriname"), ("SE", "Sweden"), ("CH", "Switzerland"),
+    ("SY", "Syria"), ("TJ", "Tajikistan"), ("TZ", "Tanzania"), ("TH", "Thailand"), ("TL", "Timor-Leste"),
+    ("TG", "Togo"), ("TO", "Tonga"), ("TT", "Trinidad and Tobago"), ("TN", "Tunisia"), ("TR", "Turkey"),
+    ("TM", "Turkmenistan"), ("TV", "Tuvalu"), ("UG", "Uganda"), ("UA", "Ukraine"), ("AE", "United Arab Emirates"),
+    ("GB", "United Kingdom"), ("US", "United States"), ("UY", "Uruguay"), ("UZ", "Uzbekistan"), ("VU", "Vanuatu"),
+    ("VA", "Vatican City"), ("VE", "Venezuela"), ("VN", "Vietnam"), ("YE", "Yemen"), ("ZM", "Zambia"),
+    ("ZW", "Zimbabwe"), ("AQ", "Antarctica")
+]
 
-COUNTRIES_LIST = sorted(COUNTRY_FLAGS.keys())
+# Часовые пояса от -12 до +14
+TIMEZONES = [f"UTC{offset}" for offset in range(-12, 15)]
+
+# ID администратора (Dfghj) и модераторов
+ADMIN_USERNAME = "Dfghj"
+# Можно добавить ID других модераторов сюда, если нужно
+MODERATOR_IDS = [] 
 
 # ---------- AUTH ----------
 
@@ -175,10 +198,9 @@ def register():
             c.execute("SELECT COALESCE(MAX(id), 0) + 1 FROM users")
             new_id = c.fetchone()[0]
             
-            avatar = None # По умолчанию нет аватарки, будет флаг
-            country = request.form.get("country", "World")
+            avatar = None # Теперь аватарка опциональна, по умолчанию нет картинки
+            country_code = request.form.get("country", "US")
             
-            # Обработка загруженного файла аватарки
             if 'avatar_file' in request.files:
                 file = request.files['avatar_file']
                 if file and file.filename != '':
@@ -189,14 +211,15 @@ def register():
                     avatar = new_filename
             
             c.execute(
-              "INSERT INTO users(id, username, password, avatar, country, nickname) VALUES(%s,%s,%s,%s,%s,%s)",
+              "INSERT INTO users(id, username, password, avatar, nickname, country_code, timezone_offset) VALUES(%s,%s,%s,%s,%s,%s,%s)",
               (
                 new_id,
                 request.form["username"],
                 request.form["password"],
                 avatar,
-                country,
-                request.form["username"]
+                request.form["username"],
+                country_code,
+                int(request.form.get("timezone_offset", 0))
               )
             )
             db.commit()
@@ -206,27 +229,21 @@ def register():
         db.close()
         return redirect("/")
     
-    # Генерация опций стран
-    country_options = "".join([f'<option value="{c}">{c}</option>' for c in COUNTRIES_LIST])
-    tz_list = sorted(list(available_timezones()))
-    tz_options = "".join([f'<option value="{tz}">{tz}</option>' for tz in tz_list])
+    country_options = "".join([f'<option value="{code}">{name}</option>' for code, name in COUNTRIES])
+    tz_options = "".join([f'<option value="{tz}">{tz}</option>' for tz in TIMEZONES])
     
     return f"""
     <body style="background:#000;color:#0f0;font-family:Courier New">
     <h3>Register</h3>
     <form method=post enctype="multipart/form-data">
-      <input name=username placeholder=username required><br>
-      <input name=password type=password placeholder=password required><br>
-      <label>Country:<br>
-        <select name=country style="width:200px">
-          <option value="" disabled selected>Select your country</option>
-          {country_options}
-        </select>
-      </label><br><br>
-      <label>Upload Avatar (Optional): <input type=file name=avatar_file accept="image/*"></label><br>
-      <small>If no avatar is uploaded, your country flag will be shown.</small><br><br>
+      <input name=username placeholder=username><br>
+      <input name=password type=password placeholder=password><br>
+      <label>Upload Avatar (optional): <input type=file name=avatar_file accept="image/*"></label><br>
+      Country:<select name=country>{country_options}</select><br>
+      Timezone:<select name=timezone_offset>{tz_options}</select><br>
       <button>Register</button>
     </form>
+    </body>
     """
 
 @app.route("/logout")
@@ -263,8 +280,8 @@ def chat():
         return redirect("/")
 
     db=get_db(); c=db.cursor()
-    c.execute("SELECT nickname,avatar,country,theme,timezone FROM users WHERE id=%s",(session["user_id"],))
-    nick,avatar,country,theme,tz=c.fetchone()
+    c.execute("SELECT nickname,avatar,theme,timezone_offset,country_code FROM users WHERE id=%s",(session["user_id"],))
+    nick,avatar,theme,tz_offset,country_code=c.fetchone()
     colors=THEMES.get(theme,THEMES["matrix"])
     
     # Получаем список ID друзей
@@ -273,7 +290,7 @@ def chat():
     
     # Получаем историю сообщений
     c.execute("""
-        SELECT m.content, m.created_at, u.nickname, u.avatar, u.country, u.timezone, u.id
+        SELECT m.content, m.created_at, u.nickname, u.avatar, u.timezone_offset, u.id, u.country_code
         FROM messages m
         JOIN users u ON m.user_id = u.id
         ORDER BY m.created_at ASC
@@ -281,22 +298,21 @@ def chat():
     """)
     messages = []
     for row in c.fetchall():
-        content, created_at, msg_nick, msg_avatar, msg_country, msg_tz, msg_user_id = row
+        content, created_at, msg_nick, msg_avatar, msg_tz_off, msg_user_id, msg_country = row
         
-        # Определяем, что показывать: аватарку или флаг
-        display_img = ""
-        if msg_avatar:
-            display_img = f'<img src="/static/avatars/{msg_avatar}" width=32 style="border-radius:50%">'
-        else:
-            flag = COUNTRY_FLAGS.get(msg_country, "🏳️")
-            display_img = f'<span style="font-size:24px">{flag}</span>'
-            
-        local_time = created_at.astimezone(ZoneInfo(tz)).strftime("%H:%M:%S")
+        # Расчет времени с учетом смещения UTC
+        utc_time = created_at.replace(tzinfo=ZoneInfo("UTC"))
+        # Создаем фиктивный таймзону для смещения, так как ZoneInfo требует имя, а у нас оффсет
+        # Проще: добавляем дельту к UTC времени
+        local_time_obj = utc_time + timedelta(hours=msg_tz_off)
+        local_time = local_time_obj.strftime("%H:%M:%S")
+        
         messages.append({
             "text": content,
             "time": local_time,
             "nick": msg_nick,
-            "img_html": display_img,
+            "avatar": msg_avatar,
+            "country": msg_country,
             "user_id": msg_user_id
         })
     
@@ -306,13 +322,23 @@ def chat():
     for m in messages:
         is_friend = m["user_id"] in friend_ids
         style = 'border: 2px solid #0f0; background: rgba(0, 255, 0, 0.1); padding: 5px;' if is_friend else ''
+        
+        # Флаг картинкой
+        flag_img = f'<img src="https://flagcdn.com/16x12/{m["country"].lower()}.png" alt="{m["country"]}" style="vertical-align:middle;margin:0 4px;">'
+        
+        # Аватарка (если есть)
+        avatar_img = f'<img src="/static/avatars/{m["avatar"]}" width=32 style="vertical-align:middle;margin-right:5px;border-radius:50%;">' if m["avatar"] else '<span style="display:inline-block;width:32px;height:32px;background:#333;border-radius:50%;margin-right:5px;"></span>'
+        
         nick_link = f'<a href="/profile/{m["user_id"]}" style="color: inherit; text-decoration: none;">{m["nick"]}</a>'
+        
         messages_html += f'''
-        <div style="{style} margin-bottom: 8px;">
-          {m["img_html"]}
-          <b>{nick_link}</b> <small>(ID: {m["user_id"]})</small>
-          <small>{m["time"]}</small><br>
-          {m["text"]}
+        <div style="{style}; margin-bottom: 8px; display:flex; align-items:flex-start;">
+          {avatar_img}
+          <div>
+            <b>{nick_link}</b> {flag_img} <small>(ID: {m["user_id"]})</small>
+            <small style="color:#888">{m["time"]}</small><br>
+            <span style="word-wrap:break-word;">{m["text"]}</span>
+          </div>
         </div>'''
 
     return f"""
@@ -328,7 +354,7 @@ def chat():
 <div id=chat style="height:70vh;overflow:auto;padding:10px">{messages_html}</div>
 
 <div style="display:flex">
-  <input id=msg style="flex:1">
+  <input id=msg style="flex:1" placeholder="Type message or /command..." onkeydown="if(event.key==='Enter')send()">
   <button onclick=send()>Send</button>
 </div>
 
@@ -342,81 +368,201 @@ s.on("connect", () => {{
 }});
 
 s.on("msg", m => {{
+    appendMessage(m);
+}});
+
+s.on("clear_chat", () => {{
+    document.getElementById('chat').innerHTML = '';
+}});
+
+function appendMessage(m) {{
     const isFriend = friendIds.includes(m.user_id);
     const style = isFriend ? 'border: 2px solid #0f0; background: rgba(0, 255, 0, 0.1); padding: 5px;' : '';
     const nickLink = `<a href="/profile/${{m.user_id}}" style="color: inherit; text-decoration: none;">${{m.nick}}</a>`;
     
-    chat.innerHTML+=`
-    <div style="${{style}} margin-bottom: 8px;">
-      ${{m.img_html}}
-      <b>${{nickLink}}</b> <small>(ID: ${{m.user_id}})</small>
-      <small>${{m.time}}</small><br>
-      ${{m.text}}
+    const avatarHtml = m.avatar ? `<img src="/static/avatars/${{m.avatar}}" width=32 style="vertical-align:middle;margin-right:5px;border-radius:50%;">` : '<span style="display:inline-block;width:32px;height:32px;background:#333;border-radius:50%;margin-right:5px;"></span>';
+    const flagImg = `<img src="https://flagcdn.com/16x12/${{m.country.toLowerCase()}}.png" alt="${{m.country}}" style="vertical-align:middle;margin:0 4px;">`;
+
+    const html = `
+    <div style="${{style}}; margin-bottom: 8px; display:flex; align-items:flex-start;">
+      ${{avatarHtml}}
+      <div>
+        <b>${{nickLink}}</b> ${{flagImg}} <small>(ID: ${{m.user_id}})</small>
+        <small style="color:#888">${{m.time}}</small><br>
+        <span style="word-wrap:break-word;">${{m.text}}</span>
+      </div>
     </div>`;
-    chat.scrollTop=chat.scrollHeight;
-}});
+    
+    const chat = document.getElementById('chat');
+    chat.innerHTML += html;
+    chat.scrollTop = chat.scrollHeight;
+}}
 
 function send(){{
-  const text = msg.value.trim();
+  const input = document.getElementById('msg');
+  const text = input.value.trim();
   if (text) {{
     s.emit("msg", text);
-    msg.value="";
+    input.value="";
   }}
 }}
 </script>
 </body>
 """
 
-# ---------- SOCKET (обработка сообщений) ----------
+# ---------- SOCKET (обработка сообщений и команд) ----------
 
 @socketio.on("msg")
 def msg(text):
     user_id = connected_users.get(request.sid)
     if user_id is None:
-        print(f"Message received from unknown SID {request.sid}, ignoring.")
         return
 
     db = None
     try:
         db = get_db()
         c = db.cursor()
+        
+        # Получаем данные пользователя
         c.execute("""
-          SELECT nickname, avatar, country, theme, timezone
+          SELECT username, nickname, avatar, timezone_offset, country_code
           FROM users WHERE id=%s
         """, (user_id,))
         user_data = c.fetchone()
-
         if not user_data:
-            print(f"User data not found for ID {user_id}, SID {request.sid}, ignoring message.")
+            return
+        username, nick, avatar, tz_offset, country_code = user_data
+
+        # Проверка на бан
+        c.execute("SELECT 1 FROM bans WHERE user_id=%s", (user_id,))
+        if c.fetchone():
+            emit("error", {"message": "You are banned!"})
             return
 
-        nick, avatar, country, theme, tz = user_data
+        # Проверка на мут
+        c.execute("SELECT until_time FROM mutes WHERE user_id=%s", (user_id,))
+        mute_row = c.fetchone()
+        if mute_row:
+            until_time = mute_row[0]
+            if datetime.now(ZoneInfo("UTC")) < until_time:
+                emit("error", {"message": f"You are muted until {until_time}!"})
+                return
+            else:
+                # Мут истек, удаляем запись
+                c.execute("DELETE FROM mutes WHERE user_id=%s", (user_id,))
+                db.commit()
 
-        # Формируем HTML для картинки/флага прямо здесь для отправки
-        if avatar:
-            img_html = f'<img src="/static/avatars/{avatar}" width=32 style="border-radius:50%">'
-        else:
-            flag = COUNTRY_FLAGS.get(country, "🏳️")
-            img_html = f'<span style="font-size:24px">{flag}</span>'
+        # Обработка команд модератора
+        if text.startswith("/"):
+            parts = text.split()
+            cmd = parts[0].lower()
+            
+            # Проверка прав модератора (ID из списка или юзернейм Dfghj)
+            is_admin = (username == ADMIN_USERNAME)
+            is_mod = (user_id in MODERATOR_IDS) or is_admin
+            
+            if cmd == "/clear":
+                if is_mod:
+                    c.execute("DELETE FROM messages")
+                    db.commit()
+                    emit("clear_chat", broadcast=True)
+                    emit("sys_msg", {"text": "Chat cleared by moderator."}, broadcast=True)
+                else:
+                    emit("error", {"message": "Permission denied."})
+                return
 
+            if cmd == "/del":
+                if is_admin:
+                    if len(parts) < 2:
+                        emit("error", {"message": "Usage: /del @ID"})
+                        return
+                    target_id_str = parts[1].replace("@", "")
+                    try:
+                        target_id = int(target_id_str)
+                        # Удаляем сообщения
+                        c.execute("DELETE FROM messages WHERE user_id=%s", (target_id,))
+                        # Удаляем дружбу
+                        c.execute("DELETE FROM friendships WHERE user_id=%s OR friend_id=%s", (target_id, target_id))
+                        # Удаляем баны/муты
+                        c.execute("DELETE FROM bans WHERE user_id=%s", (target_id,))
+                        c.execute("DELETE FROM mutes WHERE user_id=%s", (target_id,))
+                        # Удаляем юзера
+                        c.execute("DELETE FROM users WHERE id=%s", (target_id,))
+                        db.commit()
+                        emit("sys_msg", {"text": f"User {target_id} deleted by Admin."}, broadcast=True)
+                    except ValueError:
+                        emit("error", {"message": "Invalid ID format."})
+                else:
+                    emit("error", {"message": "Only Dfghj can use this command."})
+                return
+
+            if cmd == "/ban":
+                if is_mod:
+                    if len(parts) < 2:
+                        emit("error", {"message": "Usage: /ban @ID"})
+                        return
+                    target_id_str = parts[1].replace("@", "")
+                    try:
+                        target_id = int(target_id_str)
+                        c.execute("INSERT INTO bans(user_id, banned_by, reason) VALUES(%s,%s,%s) ON CONFLICT(user_id) DO NOTHING", 
+                                  (target_id, user_id, "Banned by moderator"))
+                        db.commit()
+                        emit("sys_msg", {"text": f"User {target_id} has been banned."}, broadcast=True)
+                    except ValueError:
+                        emit("error", {"message": "Invalid ID format."})
+                else:
+                    emit("error", {"message": "Permission denied."})
+                return
+
+            if cmd == "/mute":
+                if is_mod:
+                    if len(parts) < 3:
+                        emit("error", {"message": "Usage: /mute @ID hours"})
+                        return
+                    target_id_str = parts[1].replace("@", "")
+                    try:
+                        target_id = int(target_id_str)
+                        hours = int(parts[2])
+                        until = datetime.now(ZoneInfo("UTC")) + timedelta(hours=hours)
+                        c.execute("""
+                            INSERT INTO mutes(user_id, muted_by, until_time) 
+                            VALUES(%s,%s,%s) 
+                            ON CONFLICT(user_id) DO UPDATE SET until_time=%s, muted_by=%s
+                        """, (target_id, user_id, until, until, user_id))
+                        db.commit()
+                        emit("sys_msg", {"text": f"User {target_id} has been muted for {hours} hours."}, broadcast=True)
+                    except ValueError:
+                        emit("error", {"message": "Invalid ID or hours format."})
+                else:
+                    emit("error", {"message": "Permission denied."})
+                return
+            
+            # Если команда не распознана, но начинается с /, можно либо игнорировать, либо писать как текст
+            # Сейчас просто пропускаем, чтобы не спамить ошибкой, если пользователь просто написал слэш
+
+        # Обычное сообщение
         c.execute("INSERT INTO messages(user_id,content) VALUES(%s,%s)", (user_id, text))
         db.commit()
 
-        now = datetime.now(ZoneInfo(tz)).strftime("%H:%M:%S")
+        # Расчет времени
+        utc_now = datetime.now(ZoneInfo("UTC"))
+        local_time_obj = utc_now + timedelta(hours=tz_offset)
+        local_time = local_time_obj.strftime("%H:%M:%S")
 
         emit("msg",{
           "nick": nick,
-          "img_html": img_html,
+          "avatar": avatar,
+          "country": country_code,
           "text": text,
-          "time": now,
+          "time": local_time,
           "user_id": user_id
         }, broadcast=True)
 
     except Exception as e:
-        print(f"Error processing message for user {user_id}, SID {request.sid}: {e}")
+        print(f"Error processing message: {e}")
+        if db: db.rollback()
     finally:
-        if db:
-            db.close()
+        if db: db.close()
 
 # ---------- PROFILE ----------
 
@@ -429,27 +575,20 @@ def profile(user_id):
     db = get_db()
     c = db.cursor()
     
-    c.execute("SELECT id, username, nickname, avatar, country, theme FROM users WHERE id=%s", (user_id,))
+    c.execute("SELECT id, username, nickname, avatar, theme, country_code FROM users WHERE id=%s", (user_id,))
     user = c.fetchone()
     if not user:
         db.close()
         return "User not found", 404
     
-    u_id, u_username, u_nickname, u_avatar, u_country, u_theme = user
+    u_id, u_username, u_nickname, u_avatar, u_theme, u_country = user
     colors = THEMES.get(u_theme, THEMES["matrix"])
     
-    # Определяем изображение профиля
-    if u_avatar:
-        profile_img = f'<img src="/static/avatars/{u_avatar}" width=100 style="border-radius:50%; border: 4px solid {colors[1]}">'
-    else:
-        flag = COUNTRY_FLAGS.get(u_country, "🏳️")
-        profile_img = f'<div style="font-size:80px; line-height:100px; border: 4px solid {colors[1]}; border-radius:50%; width:100px; height:100px; display:inline-block;">{flag}</div>'
-
     c.execute("SELECT COUNT(*) FROM messages WHERE user_id=%s", (user_id,))
     msg_count = c.fetchone()[0]
     
     c.execute("""
-      SELECT u.id, u.username, u.nickname, u.avatar, u.country
+      SELECT u.id, u.username, u.nickname, u.avatar 
       FROM friendships f 
       JOIN users u ON f.friend_id = u.id 
       WHERE f.user_id = %s
@@ -465,13 +604,8 @@ def profile(user_id):
     db.close()
     
     friends_html = ""
-    for f_id, f_user, f_nick, f_av, f_country in friends:
-        if f_av:
-            f_img = f'<img src="/static/avatars/{f_av}" width=40 style="border-radius:50%">'
-        else:
-            f_flag = COUNTRY_FLAGS.get(f_country, "🏳️")
-            f_img = f'<span style="font-size:30px">{f_flag}</span>'
-        friends_html += f'<a href="/profile/{f_id}">{f_img}</a> '
+    for f_id, f_user, f_nick, f_av in friends:
+        friends_html += f'<a href="/profile/{f_id}"><img src="/static/avatars/{f_av}" width=40 style="border-radius:50%"></a> '
     
     action_button = ""
     if current_user_id != user_id:
@@ -480,7 +614,7 @@ def profile(user_id):
         else:
             action_button = f'<a href="/add_friend/{user_id}" style="color:#0f0">Add Friend</a>'
 
-    country_display = f"{u_country} {COUNTRY_FLAGS.get(u_country, '')}"
+    flag_img = f'<img src="https://flagcdn.com/48x36/{u_country.lower()}.png" alt="{u_country}" style="vertical-align:middle;margin:10px;">'
 
     return f"""
     <body style="margin:0;background:{colors[0]};color:{colors[1]};font-family:Courier New">
@@ -488,10 +622,10 @@ def profile(user_id):
       <a href="/chat">Back to Chat</a>
       <hr>
       <center>
-        {profile_img}
+        {flag_img}<br>
+        {f'<img src="/static/avatars/{u_avatar}" width=100 style="border-radius:50%; border: 4px solid {colors[1]}">' if u_avatar else '<div style="width:100px;height:100px;background:#333;border-radius:50%;border:4px solid white;margin:0 auto;"></div>'}
         <h2>{u_nickname}</h2>
         <p>@{u_username} (ID: {u_id})</p>
-        <p>Country: {country_display}</p>
         <p>Messages: {msg_count}</p>
         <div style="margin: 20px 0;">
           {action_button}
@@ -505,55 +639,48 @@ def profile(user_id):
 
 @app.route("/add_friend/<int:friend_id>")
 def add_friend(friend_id):
-    if "user_id" not in session:
-        return redirect("/")
-    
+    if "user_id" not in session: return redirect("/")
     user_id = session["user_id"]
-    if user_id == friend_id:
-        return "Cannot add yourself as a friend", 400
-        
-    db = get_db()
-    c = db.cursor()
+    if user_id == friend_id: return "Cannot add yourself", 400
+    db = get_db(); c = db.cursor()
     try:
         c.execute("INSERT INTO friendships(user_id, friend_id) VALUES(%s, %s)", (user_id, friend_id))
         db.commit()
-    except psycopg.IntegrityError:
-        pass
-    finally:
-        db.close()
-        
+    except psycopg.IntegrityError: pass
+    finally: db.close()
     return redirect(f"/profile/{friend_id}")
 
 @app.route("/remove_friend/<int:friend_id>")
 def remove_friend(friend_id):
-    if "user_id" not in session:
-        return redirect("/")
-    
+    if "user_id" not in session: return redirect("/")
     user_id = session["user_id"]
-    db = get_db()
-    c = db.cursor()
+    db = get_db(); c = db.cursor()
     c.execute("DELETE FROM friendships WHERE user_id=%s AND friend_id=%s", (user_id, friend_id))
-    db.commit()
-    db.close()
-    
+    db.commit(); db.close()
     return redirect(f"/profile/{friend_id}")
 
 # ---------- SETTINGS ----------
 
 @app.route("/settings", methods=["GET","POST"])
 def settings():
-    if "user_id" not in session:
-        return redirect("/")
+    if "user_id" not in session: return redirect("/")
     
     db=get_db(); c=db.cursor()
     if request.method=="POST":
-        avatar = request.form.get("avatar", "")
-        if avatar == "": avatar = None # Разрешаем убрать аватарку
+        avatar = request.form.get("avatar", "") # Оставляем старую если файл не загружен
+        country_code = request.form.get("country", "US")
+        tz_str = request.form.get("timezone_offset", "0")
+        # Парсим UTC+X в число
+        try:
+            tz_offset = int(tz_str.replace("UTC", ""))
+        except:
+            tz_offset = 0
         
-        # Обработка загруженного файла
         if 'avatar_file' in request.files:
             file = request.files['avatar_file']
             if file and file.filename != '':
+                # Удаляем старый аватар если он был кастомным (не None)
+                # (упрощено: просто перезаписываем новым именем, старый остается мусором, можно добавить очистку)
                 ext = file.filename.rsplit('.', 1)[1].lower() if '.' in file.filename else 'png'
                 new_filename = f"u{session['user_id']}_{uuid.uuid4().hex[:8]}.{ext}"
                 filepath = os.path.join(app.config['UPLOAD_FOLDER'], new_filename)
@@ -563,48 +690,44 @@ def settings():
             avatar = None
 
         c.execute("""
-        UPDATE users SET nickname=%s,avatar=%s,country=%s,theme=%s,timezone=%s
+        UPDATE users SET nickname=%s,avatar=%s,theme=%s,timezone_offset=%s,country_code=%s
         WHERE id=%s
         """, (
           request.form["nickname"],
           avatar,
-          request.form["country"],
           request.form["theme"],
-          request.form["timezone"],
+          tz_offset,
+          country_code,
           session["user_id"]
         ))
         db.commit()
         db.close()
         return redirect("/chat")
 
-    c.execute("SELECT nickname,avatar,country,theme,timezone FROM users WHERE id=%s",(session["user_id"],))
+    c.execute("SELECT nickname,avatar,theme,timezone_offset,country_code FROM users WHERE id=%s",(session["user_id"],))
     u=c.fetchone()
     db.close()
     
-    country_options = "".join([f'<option value="{c}"{" selected" if c == u[2] else ""}>{c}</option>' for c in COUNTRIES_LIST])
-    theme_options = "".join([f'<option value="{t}"{" selected" if t == u[3] else ""}>{t.title()}</option>' for t in THEMES.keys()])
-    tz_list = sorted(list(available_timezones()))
-    tz_options = "".join([f'<option value="{tz}"{" selected" if tz == u[4] else ""}>{tz}</option>' for tz in tz_list])
+    theme_options = "".join([f'<option value="{t}"{" selected" if t == u[2] else ""}>{t.title()}</option>' for t in THEMES.keys()])
+    tz_options = "".join([f'<option value="UTC{off}"{" selected" if off == u[3] else ""}>UTC{off:+d}</option>' for off in range(-12, 15)])
+    country_options = "".join([f'<option value="{code}"{" selected" if code == u[4] else ""}>{name}</option>' for code, name in COUNTRIES])
 
-    current_avatar_html = ""
+    avatar_preview = ""
     if u[1]:
-        current_avatar_html = f'Current Avatar: <img src="/static/avatars/{u[1]}" width=50><br><label><input type=checkbox name=remove_avatar> Remove Avatar</label><br>'
+        avatar_preview = f'<img src="/static/avatars/{u[1]}" width=50><br><label><input type=checkbox name=remove_avatar> Remove current avatar</label><br>'
     else:
-        current_avatar_html = f'Current Avatar: Flag of {u[2]} ({COUNTRY_FLAGS.get(u[2], "")})<br>'
+        avatar_preview = "No avatar<br>"
 
     return f"""
     <body style="background:#000;color:#0f0;font-family:Courier New">
     <h3>Settings</h3>
     <form method=post enctype="multipart/form-data">
       Nick:<input name=nickname value="{u[0]}"><br>
-      Country:<br>
-        <select name=country style="width:200px">
-          {country_options}
-        </select><br><br>
-      Upload New Avatar: <input type=file name=avatar_file accept="image/*"><br>
-      {current_avatar_html}
+      Upload Avatar: <input type=file name=avatar_file accept="image/*"><br>
+      {avatar_preview}
+      Country:<select name=country>{country_options}</select><br>
+      Timezone:<select name=timezone_offset>{tz_options}</select><br>
       Theme:<select name=theme>{theme_options}</select><br>
-      TZ:<select name=timezone>{tz_options}</select><br>
       <button>Save</button>
     </form>
     </body>
@@ -637,9 +760,3 @@ if __name__=="__main__":
     port = int(os.environ.get("PORT", 5000))
     print(f"Starting server on port {port}")
     socketio.run(app, host="0.0.0.0", port=port, debug=False, allow_unsafe_werkzeug=True)
-
-
-
-
-
-
