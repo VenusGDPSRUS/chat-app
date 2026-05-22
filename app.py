@@ -46,6 +46,15 @@ def init_db():
     )
     """)
 
+    c.execute("""
+    CREATE TABLE IF NOT EXISTS friendships(
+      id SERIAL PRIMARY KEY,
+      user_id INTEGER REFERENCES users(id),
+      friend_id INTEGER REFERENCES users(id),
+      UNIQUE(user_id, friend_id)
+    )
+    """)
+
     db.commit()
     db.close()
 init_db()
@@ -89,9 +98,14 @@ def register():
     if request.method=="POST":
         db=get_db(); c=db.cursor()
         try:
+            # Сначала получаем максимальный ID для присвоения нового порядкового номера
+            c.execute("SELECT COALESCE(MAX(id), 0) + 1 FROM users")
+            new_id = c.fetchone()[0]
+            
             c.execute(
-              "INSERT INTO users(username,password,avatar,nickname) VALUES(%s,%s,%s,%s)",
+              "INSERT INTO users(id,username,password,avatar,nickname) VALUES(%s,%s,%s,%s,%s)",
               (
+                new_id,
                 request.form["username"],
                 request.form["password"],
                 request.form.get("avatar","a1.png"),
@@ -145,8 +159,118 @@ def handle_connect():
 @socketio.on('disconnect')
 def handle_disconnect():
     sid = request.sid
-    if sid in connected_users:        user_id = connected_users.pop(sid)
+    if sid in connected_users:
+        user_id = connected_users.pop(sid)
         print(f"User {user_id} disconnected, SID {sid}")
+
+
+# ---------- PROFILE ----------
+
+@app.route("/profile/<int:user_id>")
+def profile(user_id):
+    db = get_db()
+    c = db.cursor()
+    
+    # Получаем данные профиля
+    c.execute("SELECT id, username, nickname, avatar, theme, timezone FROM users WHERE id=%s", (user_id,))
+    user_data = c.fetchone()
+    
+    if not user_data:
+        db.close()
+        return "<body style='background:#000;color:#f00;font-family:Courier New'>User not found<a href=/chat>back</a></body>"
+    
+    uid, username, nickname, avatar, theme, tz = user_data
+    
+    # Получаем список друзей
+    c.execute("""
+        SELECT u.id, u.username, u.nickname, u.avatar 
+        FROM friendships f 
+        JOIN users u ON f.friend_id = u.id 
+        WHERE f.user_id = %s
+    """, (user_id,))
+    friends = c.fetchall()
+    
+    # Проверяем, является ли этот пользователь другом текущего пользователя
+    current_user_id = session.get('user_id')
+    is_friend = False
+    is_self = False
+    
+    if current_user_id:
+        if current_user_id == user_id:
+            is_self = True
+        else:
+            c.execute("SELECT 1 FROM friendships WHERE user_id=%s AND friend_id=%s", (current_user_id, user_id))
+            is_friend = c.fetchone() is not None
+    
+    db.close()
+    
+    colors = THEMES.get(theme, THEMES["matrix"])
+    
+    friends_html = ""
+    for fid, fusername, fnick, favatar in friends:
+        friends_html += f'<div style="display:flex;align-items:center;margin:5px;"><img src="/static/avatars/{favatar}" width=32> <a href="/profile/{fid}" style="color:{colors[1]}">{fnick}</a> (ID: {fid})</div>'
+    
+    action_button = ""
+    if not is_self and current_user_id and not is_friend:
+        action_button = f'<a href="/add_friend/{user_id}" style="color:#0f0">[Add as Friend]</a> '
+    elif not is_self and current_user_id and is_friend:
+        action_button = f'<a href="/remove_friend/{user_id}" style="color:#f00">[Remove Friend]</a> '
+    
+    return f"""
+    <body style="margin:0;background:{colors[0]};color:{colors[1]};font-family:Courier New">
+    <div style="padding:10px;border-bottom:1px solid {colors[1]}">
+      <a href=/chat>Back to Chat</a>
+      <a href=/leaderboard>Leaderboard</a>
+    </div>
+    <div style="padding:20px">
+      <img src="/static/avatars/{avatar}" width=64><br>
+      <h2>{nickname}</h2>
+      <p>Username: {username}</p>
+      <p>ID: {uid}</p>
+      <p>Timezone: {tz}</p>
+      <p>{action_button}</p>
+      <h3>Friends ({len(friends)}):</h3>
+      {friends_html if friends_html else '<p>No friends yet</p>'}
+    </div>
+    </body>
+    """
+
+@app.route("/add_friend/<int:friend_id>")
+def add_friend(friend_id):
+    if "user_id" not in session:
+        return redirect("/")
+    
+    current_user_id = session["user_id"]
+    
+    if current_user_id == friend_id:
+        return redirect(f"/profile/{friend_id}")
+    
+    db = get_db()
+    c = db.cursor()
+    try:
+        c.execute("INSERT INTO friendships(user_id, friend_id) VALUES(%s, %s)", (current_user_id, friend_id))
+        db.commit()
+    except psycopg.IntegrityError:
+        pass  # Уже друзья
+    finally:
+        db.close()
+    
+    return redirect(f"/profile/{friend_id}")
+
+@app.route("/remove_friend/<int:friend_id>")
+def remove_friend(friend_id):
+    if "user_id" not in session:
+        return redirect("/")
+    
+    current_user_id = session["user_id"]
+    
+    db = get_db()
+    c = db.cursor()
+    c.execute("DELETE FROM friendships WHERE user_id=%s AND friend_id=%s", (current_user_id, friend_id))
+    db.commit()
+    db.close()
+    
+    return redirect(f"/profile/{friend_id}")
 
 
 # ---------- CHAT ----------
@@ -160,6 +284,12 @@ def chat():
     c.execute("SELECT nickname,avatar,theme,timezone FROM users WHERE id=%s",(session["user_id"],))
     nick,avatar,theme,tz=c.fetchone()
     colors=THEMES.get(theme,THEMES["matrix"])
+    
+    # Получаем список друзей текущего пользователя
+    c.execute("""
+        SELECT friend_id FROM friendships WHERE user_id = %s
+    """, (session["user_id"],))
+    friend_ids = [row[0] for row in c.fetchall()]
     db.close()
 
     return f"""
@@ -182,15 +312,19 @@ def chat():
 <script src="https://cdn.socket.io/4.7.2/socket.io.min.js"></script>
 <script>
 let s=io(); // Подключаемся к текущему домену/порту
+// Передаем список ID друзей на клиент
+const friendIds = {friend_ids};
 s.on("connect", () => {{
     console.log("Connected to server via Socket.IO");
 }});
 s.on("msg",m=>{{
+  const isFriend = friendIds.includes(m.user_id);
+  const highlightStyle = isFriend ? 'border-left: 3px solid #0f0; background: rgba(0,255,0,0.1);' : '';
   chat.innerHTML+=`
-  <div>
+  <div style="padding:5px;margin:5px 0;{highlightStyle}">
     <img src="/static/avatars/${{m.avatar}}" width=32>
-    <b>${{m.nick}}</b>
-    <small>${{m.time}}</small><br>
+    <b><a href="/profile/${{m.user_id}}" style="color:{colors[1]}">${{m.nick}}</a></b>
+    <small>[ID: ${{m.user_id}}] ${{m.time}}</small><br>
     ${{m.text}}
   </div>`;
   chat.scrollTop=chat.scrollHeight;
@@ -243,7 +377,9 @@ def msg(text):
         emit("msg",{
           "nick": nick,
           "avatar": avatar,
-          "text": text,          "time": now
+          "text": text,
+          "time": now,
+          "user_id": user_id
         }, broadcast=True)
 
     except Exception as e:
@@ -300,15 +436,15 @@ def settings():
 def leaderboard():
     db=get_db(); c=db.cursor()
     c.execute("""
-    SELECT u.username, COUNT(m.id) as msg_count
+    SELECT u.id, u.username, COUNT(m.id) as msg_count
     FROM users u LEFT JOIN messages m ON u.id=m.user_id
     GROUP BY u.id ORDER BY msg_count DESC
     """)
     rows=c.fetchall()
     db.close()
     out="<body style='background:#000;color:#0f0;font-family:Courier New'><h3>Leaderboard</h3>"
-    for u, cnt in rows:
-        out+=f"{u}: {cnt}<br>"
+    for uid, u, cnt in rows:
+        out+=f"<a href='/profile/{uid}' style='color:#0f0'>{u}</a> (ID: {uid}): {cnt}<br>"
     return out+"<a href=/chat>back</a></body>"
 
 # ---------- RUN ----------
