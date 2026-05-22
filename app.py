@@ -1,12 +1,15 @@
 import os
 import psycopg
-from flask import Flask, request, session, redirect
+from flask import Flask, request, session, redirect, send_from_directory
 from flask_socketio import SocketIO, emit, disconnect
 from datetime import datetime
-from zoneinfo import ZoneInfo
+from zoneinfo import ZoneInfo, available_timezones
+import uuid
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("SECRET_KEY", "dev")
+app.config['UPLOAD_FOLDER'] = 'static/avatars'
+app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024  # 16MB max
 
 # Важно: manage_session=False для корректной работы сессии Flask
 socketio = SocketIO(app, async_mode="threading", manage_session=False)
@@ -107,13 +110,25 @@ def register():
             c.execute("SELECT COALESCE(MAX(id), 0) + 1 FROM users")
             new_id = c.fetchone()[0]
             
+            avatar = request.form.get("avatar","a1.png")
+            
+            # Обработка загруженного файла аватарки
+            if 'avatar_file' in request.files:
+                file = request.files['avatar_file']
+                if file and file.filename != '':
+                    ext = file.filename.rsplit('.', 1)[1].lower() if '.' in file.filename else 'png'
+                    new_filename = f"u{new_id}_{uuid.uuid4().hex[:8]}.{ext}"
+                    filepath = os.path.join(app.config['UPLOAD_FOLDER'], new_filename)
+                    file.save(filepath)
+                    avatar = new_filename
+            
             c.execute(
               "INSERT INTO users(id, username, password, avatar, nickname) VALUES(%s,%s,%s,%s,%s)",
               (
                 new_id,
                 request.form["username"],
                 request.form["password"],
-                request.form.get("avatar","a1.png"),
+                avatar,
                 request.form["username"]
               )
             )
@@ -123,12 +138,20 @@ def register():
              return "Username already exists!", 400
         db.close()
         return redirect("/")
-    return """
+    
+    # Список доступных тем и часовых поясов
+    theme_options = "".join([f'<option value="{t}">{t.title()}</option>' for t in THEMES.keys()])
+    tz_list = sorted(list(available_timezones()))
+    tz_options = "".join([f'<option value="{tz}">{tz}</option>' for tz in tz_list])
+    
+    return f"""
     <body style="background:#000;color:#0f0;font-family:Courier New">
     <h3>Register</h3>
-    <form method=post>
+    <form method=post enctype="multipart/form-data">
       <input name=username placeholder=username><br>
       <input name=password type=password placeholder=password><br>
+      <label>Upload Avatar: <input type=file name=avatar_file accept="image/*"></label><br>
+      <small>Or select default:</small><br>
       <input type=hidden name=avatar id=avatar>
       <img src=/static/avatars/a1.png onclick="pick('a1.png')" style="cursor:pointer;border:2px solid transparent" onmouseover="this.style.border='2px solid #0f0'" onmouseout="this.style.border='2px solid transparent'">
       <img src=/static/avatars/a2.png onclick="pick('a2.png')" style="cursor:pointer;border:2px solid transparent" onmouseover="this.style.border='2px solid #0f0'" onmouseout="this.style.border='2px solid transparent'">
@@ -136,7 +159,7 @@ def register():
       <button>Register</button>
     </form>
     <script>
-      function pick(a){avatar.value=a;}
+      function pick(a){{avatar.value=a;}}
     </script>
     """
 
@@ -181,7 +204,41 @@ def chat():
     # Получаем список ID друзей
     c.execute("SELECT friend_id FROM friendships WHERE user_id=%s", (session["user_id"],))
     friend_ids = [row[0] for row in c.fetchall()]
+    
+    # Получаем историю сообщений
+    c.execute("""
+        SELECT m.content, m.created_at, u.nickname, u.avatar, u.timezone, u.id
+        FROM messages m
+        JOIN users u ON m.user_id = u.id
+        ORDER BY m.created_at ASC
+        LIMIT 100
+    """)
+    messages = []
+    for row in c.fetchall():
+        content, created_at, msg_nick, msg_avatar, msg_tz, msg_user_id = row
+        local_time = created_at.astimezone(ZoneInfo(tz)).strftime("%H:%M:%S")
+        messages.append({
+            "text": content,
+            "time": local_time,
+            "nick": msg_nick,
+            "avatar": msg_avatar,
+            "user_id": msg_user_id
+        })
+    
     db.close()
+
+    messages_html = ""
+    for m in messages:
+        is_friend = m["user_id"] in friend_ids
+        style = 'border: 2px solid #0f0; background: rgba(0, 255, 0, 0.1); padding: 5px;' if is_friend else ''
+        nick_link = f'<a href="/profile/{m["user_id"]}" style="color: inherit; text-decoration: none;">{m["nick"]}</a>'
+        messages_html += f'''
+        <div style="{style}">
+          <img src="/static/avatars/{m["avatar"]}" width=32>
+          <b>{nick_link}</b> <small>(ID: {m["user_id"]})</small>
+          <small>{m["time"]}</small><br>
+          {m["text"]}
+        </div>'''
 
     return f"""
 <!doctype html>
@@ -193,7 +250,7 @@ def chat():
   <a href=/logout>Logout</a>
 </div>
 
-<div id=chat style="height:70vh;overflow:auto;padding:10px"></div>
+<div id=chat style="height:70vh;overflow:auto;padding:10px">{messages_html}</div>
 
 <div style="display:flex">
   <input id=msg style="flex:1">
@@ -398,12 +455,24 @@ def settings():
     
     db=get_db(); c=db.cursor()
     if request.method=="POST":
+        avatar = request.form.get("avatar", "")
+        
+        # Обработка загруженного файла аватарки
+        if 'avatar_file' in request.files:
+            file = request.files['avatar_file']
+            if file and file.filename != '':
+                ext = file.filename.rsplit('.', 1)[1].lower() if '.' in file.filename else 'png'
+                new_filename = f"u{session['user_id']}_{uuid.uuid4().hex[:8]}.{ext}"
+                filepath = os.path.join(app.config['UPLOAD_FOLDER'], new_filename)
+                file.save(filepath)
+                avatar = new_filename
+        
         c.execute("""
         UPDATE users SET nickname=%s,avatar=%s,theme=%s,timezone=%s
         WHERE id=%s
-        """,(
+        """, (
           request.form["nickname"],
-          request.form["avatar"],
+          avatar,
           request.form["theme"],
           request.form["timezone"],
           session["user_id"]
@@ -415,19 +484,29 @@ def settings():
     c.execute("SELECT nickname,avatar,theme,timezone FROM users WHERE id=%s",(session["user_id"],))
     u=c.fetchone()
     db.close()
+    
+    # Список доступных тем и часовых поясов
+    theme_options = "".join([f'<option value="{t}"{" selected" if t == u[2] else ""}>{t.title()}</option>' for t in THEMES.keys()])
+    tz_list = sorted(list(available_timezones()))
+    tz_options = "".join([f'<option value="{tz}"{" selected" if tz == u[3] else ""}>{tz}</option>' for tz in tz_list])
 
     return f"""
     <body style="background:#000;color:#0f0;font-family:Courier New">
     <h3>Settings</h3>
-    <form method=post>
+    <form method=post enctype="multipart/form-data">
       Nick:<input name=nickname value="{u[0]}"><br>
-      Avatar:<input name=avatar value="{u[1]}"><br>
-      Theme:<input name=theme value="{u[2]}"><br>
-      TZ:<input name=timezone value="{u[3]}"><br>
+      Upload Avatar: <input type=file name=avatar_file accept="image/*"><br>
+      Current Avatar: <img src="/static/avatars/{u[1]}" width=50><br>
+      Theme:<select name=theme>{theme_options}</select><br>
+      TZ:<select name=timezone>{tz_options}</select><br>
       <button>Save</button>
     </form>
     </body>
     """
+
+@app.route("/static/avatars/<path:filename>")
+def serve_avatar(filename):
+    return send_from_directory(app.config['UPLOAD_FOLDER'], filename)
 
 # ---------- LEADERBOARD ----------
 
