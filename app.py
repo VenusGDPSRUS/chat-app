@@ -11,6 +11,12 @@ app.secret_key = os.environ.get("SECRET_KEY", "dev")
 app.config['UPLOAD_FOLDER'] = 'static/avatars'
 app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024  # 16MB max
 
+# --- ИСПРАВЛЕНИЕ: Создаем папку для аватарок при старте ---
+if not os.path.exists(app.config['UPLOAD_FOLDER']):
+    os.makedirs(app.config['UPLOAD_FOLDER'])
+    print(f"Created directory: {app.config['UPLOAD_FOLDER']}")
+# ----------------------------------------------------------
+
 # Важно: manage_session=False для корректной работы сессии Flask
 socketio = SocketIO(app, async_mode="threading", manage_session=False)
 
@@ -60,7 +66,7 @@ def init_db():
     db.commit()
     db.close()
 
-# Вызываем init_db только если есть DATABASE_URL, иначе пропускаем (для локальной проверки)
+# Вызываем init_db только если есть DATABASE_URL
 if DATABASE_URL:
     try:
         init_db()
@@ -106,7 +112,7 @@ def register():
     if request.method=="POST":
         db=get_db(); c=db.cursor()
         try:
-            # Получаем следующий доступный ID вручную, чтобы он был порядковым и предсказуемым
+            # Получаем следующий доступный ID вручную
             c.execute("SELECT COALESCE(MAX(id), 0) + 1 FROM users")
             new_id = c.fetchone()[0]
             
@@ -327,7 +333,7 @@ def msg(text):
           "avatar": avatar,
           "text": text,
           "time": now,
-          "user_id": user_id # Добавляем ID пользователя в сообщение
+          "user_id": user_id
         }, broadcast=True)
 
     except Exception as e:
@@ -372,7 +378,6 @@ def profile(user_id):
     
     # Проверка статуса дружбы для текущего пользователя
     is_friend = False
-    pending = False # Можно добавить логику заявок, пока просто друзья
     if current_user_id != user_id:
         c.execute("SELECT 1 FROM friendships WHERE user_id=%s AND friend_id=%s", (current_user_id, user_id))
         if c.fetchone():
