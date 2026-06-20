@@ -1,6 +1,6 @@
 import os
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 # Попытка импорта psycopg. Если не получится (нет БД), работаем в демо-режиме
@@ -353,6 +353,8 @@ def handle_msg(text):
         msg_data = {"nick": nick, "avatar": avatar, "text": text, "time": now, "user_id": user_id, "country": country, "state": state}
         DEMO_MESSAGES.append(msg_data)
 
+    # Используем безопасно экранированную строку для флагов
+    msg_data['flags_html'] = get_flags_html_safe(msg_data['country'], msg_data['state'])
     emit("msg", msg_data, broadcast=True)
 
 def process_command(user_id, text):
@@ -402,7 +404,7 @@ def process_command(user_id, text):
         try:
             tid = int(target)
             hours = int(parts[2])
-            MUTED_USERS[tid] = datetime.now().replace(microsecond=0) + datetime.timedelta(hours=hours)
+            MUTED_USERS[tid] = datetime.now().replace(microsecond=0) + timedelta(hours=hours)
             emit("sys", f"User {tid} muted for {hours} hours", broadcast=True)
         except: pass
 
@@ -454,15 +456,20 @@ def chat():
         """)
         for r in c.fetchall():
             local_time = r[1].astimezone(ZoneInfo(r[6])).strftime("%H:%M:%S")
+            # Используем безопасно экранированную строку для флагов
+            flags_html = get_flags_html_safe(r[4], r[5]) # country, state
             messages.append({
                 "text": r[0], "time": local_time, "nick": r[2], "avatar": r[3],
-                "country": r[4], "state": r[5], "user_id": r[7]
+                "country": r[4], "state": r[5], "user_id": r[7], "flags_html": flags_html
             })
         db.close()
     else:
         u = DEMO_USERS.get(uid, {})
         user_info = {"nick": u.get("nickname"), "avatar": u.get("avatar"), "country": u.get("country"), "state": u.get("state"), "theme": "matrix", "tz": "UTC"}
         messages = DEMO_MESSAGES[-100:]
+        # Добавляем безопасные флаги для демо-сообщений
+        for msg in messages:
+            msg['flags_html'] = get_flags_html_safe(msg['country'], msg['state'])
 
     colors = THEMES.get(user_info.get("theme", "matrix"), THEMES["matrix"])
     
@@ -472,8 +479,8 @@ def chat():
         is_friend = m["user_id"] in friend_ids
         style = 'border: 2px solid #0f0; background: rgba(0,255,0,0.1); padding:5px;' if is_friend else ''
         
-        # Логика флагов
-        flags_html = get_flags_html(m["country"], m["state"])
+        # Теперь используем уже подготовленный HTML для флагов
+        flags_html = m.get('flags_html', '')
         
         nick_link = f'<a href="/profile/{m["user_id"]}" style="color:inherit;text-decoration:none">{m["nick"]}</a>'
         msgs_html += f"""
@@ -506,10 +513,11 @@ def chat():
       s.on("msg", m => {{
         const isFriend = friendIds.includes(m.user_id);
         const style = isFriend ? 'border: 2px solid #0f0; background: rgba(0,255,0,0.1); padding:5px;' : '';
-        const flags = `{get_flags_html(m['country'], m['state'])}`;
+        // Используем заранее подготовленный HTML для флагов
+        const flagsHtml = m.flags_html || ''; // Обеспечиваем безопасность
         const nickLink = `<a href="/profile/${{m.user_id}}" style="color:inherit;text-decoration:none">${{m.nick}}</a>`;
         
-        const html = `<div style="${{style}}">${{flags}}<b>${{nickLink}}</b> <small>(${{m.time}})</small><br>${{m.text}}</div><br>`;
+        const html = `<div style="${{style}}">${{flagsHtml}}<b>${{nickLink}}</b> <small>(${{m.time}})</small><br>${{m.text}}</div><br>`;
         document.getElementById('chat').innerHTML += html;
         document.getElementById('chat').scrollTop = document.getElementById('chat').scrollHeight;
       }});
@@ -532,9 +540,11 @@ def chat():
     </body>
     """
 
-def get_flags_html(country, state):
-    if not country: return ""
-    
+def get_flags_html_safe(country, state):
+    """Безопасно генерирует HTML для флага, обрабатывая возможные ошибки."""
+    if not country:
+        return ""
+
     # Код страны для flagcdn (ISO 2 буквы)
     # Простая маппинг функция (можно расширить)
     country_codes = {
@@ -544,19 +554,34 @@ def get_flags_html(country, state):
         "South Korea": "kr", "Ukraine": "ua", "Poland": "pl", "Turkey": "tr"
         # Добавьте другие по необходимости, или используйте общий флаг если нет кода
     }
-    
+
     code = country_codes.get(country, "")
     if not code:
         # Пытаемся сгенерировать код из названия (первые 2 буквы, грубо)
-        code = country[:2].lower()
-        
-    flag_main = f'<img src="https://flagcdn.com/w40/{code}.png" style="vertical-align:middle;margin-right:5px" title="{country}">'
-    
+        # Убедимся, что строка содержит только допустимые символы для URL
+        clean_country = ''.join(c for c in country if c.isalnum()).lower()
+        if len(clean_country) >= 2:
+            code = clean_country[:2]
+        else:
+             # Если очистка не дала результата, возвращаем пустую строку
+             return ""
+
+    # Экранируем код страны перед вставкой в HTML/JS
+    code = code.replace('"', '&quot;').replace("'", "&#x27;")
+    escaped_country = country.replace('"', '&quot;').replace("'", "&#x27;")
+
+    flag_main = f'<img src="https://flagcdn.com/w40/{code}.png" style="vertical-align:middle;margin-right:5px" title="{escaped_country}">' if code else ''
+
     flag_state = ""
     if country == "United States" and state:
+        # Убедимся, что state - это действительный код штата
         state_code = state.lower()
-        flag_state = f'<img src="https://flagcdn.com/w40/{state_code}.png" style="vertical-align:middle;margin-left:5px" title="{US_STATES.get(state, state)}">'
-        
+        if state_code in US_STATES:
+            # Экранируем код штата перед вставкой
+            state_code = state_code.replace('"', '&quot;').replace("'", "&#x27;")
+            escaped_state_name = US_STATES[state].replace('"', '&quot;').replace("'", "&#x27;")
+            flag_state = f'<img src="https://flagcdn.com/w40/{state_code}.png" style="vertical-align:middle;margin-left:5px" title="{escaped_state_name}">'
+
     return f"{flag_main}{flag_state}"
 
 @app.route("/profile/<int:user_id>")
