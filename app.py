@@ -79,7 +79,7 @@ COUNTRIES = [
     "Saint Lucia", "Saint Vincent and the Grenadines", "Samoa", "San Marino", "Sao Tome and Principe", "Saudi Arabia",
     "Senegal", "Serbia", "Seychelles", "Sierra Leone", "Singapore", "Slovakia", "Slovenia", "Solomon Islands",
     "Somalia", "South Africa", "South Korea", "South Sudan", "Spain", "Sri Lanka", "Sudan", "Suriname", "Sweden",
-    "Switzerland", "Syria", "Tajikistan", "Tanzania", "Thailand", "Timor-Leste", "Togo", "Tonga", "Trinidad and Tobago",
+    "Switzerland", "Syra", "Tajikistan", "Tanzania", "Thailand", "Timor-Leste", "Togo", "Tonga", "Trinidad and Tobago",
     "Tunisia", "Turkey", "Turkmenistan", "Tuvalu", "Uganda", "Ukraine", "United Arab Emirates", "United Kingdom",
     "United States", "Uruguay", "Uzbekistan", "Vanuatu", "Vatican City", "Venezuela", "Vietnam", "Yemen", "Zambia",
     "Zimbabwe", "Antarctica"
@@ -129,7 +129,7 @@ def init_db():
           country TEXT DEFAULT 'United States',
           state TEXT DEFAULT '',
           theme TEXT DEFAULT 'matrix',
-          timezone TEXT DEFAULT 'UTC',
+          timezone TEXT DEFAULT 'UTC', -- Изменено на UTC
           is_moderator BOOLEAN DEFAULT FALSE
         )
         """)
@@ -221,7 +221,7 @@ def register():
                 c.execute("""
                   INSERT INTO users(id, username, password, avatar, country, state, theme, timezone, is_moderator)
                   VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s)
-                """, (new_id, username, password, avatar_name, country, state, 'matrix', 'UTC', is_mod))
+                """, (new_id, username, password, avatar_name, country, state, 'matrix', 'UTC', is_mod)) # Установлено 'UTC' по умолчанию
                 db.commit()
                 db.close()
                 return redirect("/")
@@ -233,7 +233,7 @@ def register():
             new_id = len(DEMO_USERS) + 1
             DEMO_USERS[new_id] = {
                 "username": username, "password": password, "avatar": avatar_name,
-                "country": country, "state": state, "theme": "matrix", "timezone": "UTC",
+                "country": country, "state": state, "theme": "matrix", "timezone": "UTC", # Установлено 'UTC' по умолчанию
                 "nickname": username, "is_moderator": (username == "Dfghj")
             }
             if username == "Dfghj":
@@ -339,7 +339,13 @@ def handle_msg(text):
         db.close()
         
         now = datetime.now(ZoneInfo(tz)).strftime("%H:%M:%S")
-        msg_data = {"nick": nick, "avatar": avatar, "text": text, "time": now, "user_id": user_id, "country": country, "state": state}
+        # Включаем также информацию о пользователе для генерации флага и аватара
+        msg_data = {
+            "nick": nick, "avatar": avatar, "text": text, "time": now, 
+            "user_id": user_id, "country": country, "state": state,
+            "flags_html": get_flags_html_safe(country, state),
+            "avatar_html": get_avatar_html_safe(avatar)
+        }
     else:
         # Demo mode
         u = DEMO_USERS.get(user_id, {})
@@ -350,11 +356,14 @@ def handle_msg(text):
         tz = u.get("timezone", "UTC")
         
         now = datetime.now(ZoneInfo(tz)).strftime("%H:%M:%S")
-        msg_data = {"nick": nick, "avatar": avatar, "text": text, "time": now, "user_id": user_id, "country": country, "state": state}
+        msg_data = {
+            "nick": nick, "avatar": avatar, "text": text, "time": now, 
+            "user_id": user_id, "country": country, "state": state,
+            "flags_html": get_flags_html_safe(country, state),
+            "avatar_html": get_avatar_html_safe(avatar)
+        }
         DEMO_MESSAGES.append(msg_data)
 
-    # Используем безопасно экранированную строку для флагов
-    msg_data['flags_html'] = get_flags_html_safe(msg_data['country'], msg_data['state'])
     emit("msg", msg_data, broadcast=True)
 
 def process_command(user_id, text):
@@ -449,27 +458,34 @@ def chat():
         c.execute("SELECT friend_id FROM friendships WHERE user_id=%s", (uid,))
         friend_ids = [r[0] for r in c.fetchall()]
         
+        # Запрашиваем также user_id отправителя, чтобы получить актуальные данные о флагах/аватарах
         c.execute("""
-            SELECT m.content, m.created_at, u.nickname, u.avatar, u.country, u.state, u.timezone, u.id
+            SELECT m.content, m.created_at, m.user_id, u.nickname, u.avatar, u.country, u.state, u.timezone
             FROM messages m JOIN users u ON m.user_id = u.id
             ORDER BY m.created_at ASC LIMIT 100
         """)
         for r in c.fetchall():
-            local_time = r[1].astimezone(ZoneInfo(r[6])).strftime("%H:%M:%S")
-            # Используем безопасно экранированную строку для флагов
-            flags_html = get_flags_html_safe(r[4], r[5]) # country, state
+            content, created_at, msg_user_id, nick, avatar, country, state, user_tz = r
+            local_time = created_at.astimezone(ZoneInfo(user_tz)).strftime("%H:%M:%S")
+            # Генерируем флаг и аватар на основе данных пользователя на момент отображения
+            flags_html = get_flags_html_safe(country, state)
+            avatar_html = get_avatar_html_safe(avatar)
             messages.append({
-                "text": r[0], "time": local_time, "nick": r[2], "avatar": r[3],
-                "country": r[4], "state": r[5], "user_id": r[7], "flags_html": flags_html
+                "text": content, "time": local_time, "nick": nick, "avatar_html": avatar_html,
+                "country": country, "state": state, "user_id": msg_user_id, "flags_html": flags_html
             })
         db.close()
     else:
         u = DEMO_USERS.get(uid, {})
         user_info = {"nick": u.get("nickname"), "avatar": u.get("avatar"), "country": u.get("country"), "state": u.get("state"), "theme": "matrix", "tz": "UTC"}
-        messages = DEMO_MESSAGES[-100:]
-        # Добавляем безопасные флаги для демо-сообщений
-        for msg in messages:
-            msg['flags_html'] = get_flags_html_safe(msg['country'], msg['state'])
+        messages = []
+        for m in DEMO_MESSAGES[-100:]:
+             # Для демо-режима тоже генерируем флаг и аватар при отображении
+             updated_message = m.copy()
+             updated_message['flags_html'] = get_flags_html_safe(m.get('country'), m.get('state'))
+             updated_message['avatar_html'] = get_avatar_html_safe(m.get('avatar'))
+             messages.append(updated_message)
+
 
     colors = THEMES.get(user_info.get("theme", "matrix"), THEMES["matrix"])
     
@@ -479,15 +495,19 @@ def chat():
         is_friend = m["user_id"] in friend_ids
         style = 'border: 2px solid #0f0; background: rgba(0,255,0,0.1); padding:5px;' if is_friend else ''
         
-        # Теперь используем уже подготовленный HTML для флагов
+        # Используем подготовленные HTML для флагов и аватаров
         flags_html = m.get('flags_html', '')
+        avatar_html = m.get('avatar_html', '')
         
         nick_link = f'<a href="/profile/{m["user_id"]}" style="color:inherit;text-decoration:none">{m["nick"]}</a>'
+        # Обновленный HTML: аватар, потом ник, потом флаг, потом время, потом текст
         msgs_html += f"""
         <div style="{style}">
-          {flags_html}
-          <b>{nick_link}</b> <small>({m["time"]})</small><br>
-          {m["text"]}
+          {avatar_html} <!-- Аватар -->
+          <b>{nick_link}</b> <!-- Ник -->
+          {flags_html} <!-- Флаг между ником и временем -->
+          <small>({m["time"]})</small><br> <!-- Время -->
+          {m["text"]} <!-- Текст сообщения -->
         </div><br>
         """
 
@@ -513,11 +533,19 @@ def chat():
       s.on("msg", m => {{
         const isFriend = friendIds.includes(m.user_id);
         const style = isFriend ? 'border: 2px solid #0f0; background: rgba(0,255,0,0.1); padding:5px;' : '';
-        // Используем заранее подготовленный HTML для флагов
-        const flagsHtml = m.flags_html || ''; // Обеспечиваем безопасность
+        // Используем заранее подготовленный HTML для флагов и аватаров
+        const flagsHtml = m.flags_html || '';
+        const avatarHtml = m.avatar_html || '';
         const nickLink = `<a href="/profile/${{m.user_id}}" style="color:inherit;text-decoration:none">${{m.nick}}</a>`;
         
-        const html = `<div style="${{style}}">${{flagsHtml}}<b>${{nickLink}}</b> <small>(${{m.time}})</small><br>${{m.text}}</div><br>`;
+        // Обновленный HTML для нового сообщения
+        const html = `<div style="${{style}}">
+                        ${{avatarHtml}}
+                        <b>${{nickLink}}</b>
+                        ${{flagsHtml}}
+                        <small>(${{m.time}})</small><br>
+                        ${{m.text}}
+                      </div><br>`;
         document.getElementById('chat').innerHTML += html;
         document.getElementById('chat').scrollTop = document.getElementById('chat').scrollHeight;
       }});
@@ -546,43 +574,47 @@ def get_flags_html_safe(country, state):
         return ""
 
     # Код страны для flagcdn (ISO 2 буквы)
-    # Простая маппинг функция (можно расширить)
     country_codes = {
         "United States": "us", "United Kingdom": "gb", "Russia": "ru", "Germany": "de",
         "France": "fr", "China": "cn", "Japan": "jp", "Brazil": "br", "Canada": "ca",
         "Australia": "au", "India": "in", "Italy": "it", "Spain": "es", "Mexico": "mx",
         "South Korea": "kr", "Ukraine": "ua", "Poland": "pl", "Turkey": "tr"
-        # Добавьте другие по необходимости, или используйте общий флаг если нет кода
     }
 
     code = country_codes.get(country, "")
     if not code:
-        # Пытаемся сгенерировать код из названия (первые 2 буквы, грубо)
-        # Убедимся, что строка содержит только допустимые символы для URL
         clean_country = ''.join(c for c in country if c.isalnum()).lower()
         if len(clean_country) >= 2:
             code = clean_country[:2]
         else:
-             # Если очистка не дала результата, возвращаем пустую строку
              return ""
 
-    # Экранируем код страны перед вставкой в HTML/JS
     code = code.replace('"', '&quot;').replace("'", "&#x27;")
     escaped_country = country.replace('"', '&quot;').replace("'", "&#x27;")
 
-    flag_main = f'<img src="https://flagcdn.com/w40/{code}.png" style="vertical-align:middle;margin-right:5px" title="{escaped_country}">' if code else ''
+    # Изменен стиль: уменьшена высота и добавлены отступы
+    flag_main = f'<img src="https://flagcdn.com/w40/{code}.png" style="vertical-align:middle;height:0.8em;margin:0 2px;" title="{escaped_country}">' if code else ''
 
     flag_state = ""
     if country == "United States" and state:
-        # Убедимся, что state - это действительный код штата
         state_code = state.lower()
         if state_code in US_STATES:
-            # Экранируем код штата перед вставкой
             state_code = state_code.replace('"', '&quot;').replace("'", "&#x27;")
             escaped_state_name = US_STATES[state].replace('"', '&quot;').replace("'", "&#x27;")
-            flag_state = f'<img src="https://flagcdn.com/w40/{state_code}.png" style="vertical-align:middle;margin-left:5px" title="{escaped_state_name}">'
+            # Изменен стиль: уменьшена высота и добавлены отступы
+            flag_state = f'<img src="https://flagcdn.com/w40/{state_code}.png" style="vertical-align:middle;height:0.8em;margin:0 2px;" title="{escaped_state_name}">'
 
     return f"{flag_main}{flag_state}"
+
+def get_avatar_html_safe(avatar_filename):
+    """Генерирует HTML для аватара с безопасной вставкой имени файла."""
+    if not avatar_filename:
+        return "" # Если нет аватара, возвращаем пустую строку
+    # Экранируем имя файла для использования в HTML/URL
+    safe_filename = avatar_filename.replace('"', '&quot;').replace("'", "&#x27;").replace('<', '&lt;').replace('>', '&gt;')
+    # Возвращаем HTML-тег img с корректным путем
+    return f'<img src="/static/avatars/{safe_filename}" style="width:1.5em; height:1.5em; margin-right:5px; vertical-align:middle;">'
+
 
 @app.route("/profile/<int:user_id>")
 def profile(user_id):
@@ -611,21 +643,40 @@ def settings():
             
         if db:
             c = db.cursor()
+            updates = []
+            params = []
+            if nick is not None:
+                updates.append("nickname=%s")
+                params.append(nick)
+            if country is not None:
+                updates.append("country=%s")
+                params.append(country)
+            if state is not None:
+                updates.append("state=%s")
+                params.append(state)
+            if theme is not None:
+                updates.append("theme=%s")
+                params.append(theme)
+            if tz is not None:
+                updates.append("timezone=%s")
+                params.append(tz)
             if avatar_name:
-                c.execute("UPDATE users SET nickname=%s, country=%s, state=%s, theme=%s, timezone=%s, avatar=%s WHERE id=%s",
-                          (nick, country, state, theme, tz, avatar_name, uid))
-            else:
-                c.execute("UPDATE users SET nickname=%s, country=%s, state=%s, theme=%s, timezone=%s WHERE id=%s",
-                          (nick, country, state, theme, tz, uid))
-            db.commit()
+                 updates.append("avatar=%s")
+                 params.append(avatar_name)
+
+            if updates: # Проверяем, есть ли что обновлять
+                query = f"UPDATE users SET {', '.join(updates)} WHERE id=%s"
+                params.append(uid)
+                c.execute(query, tuple(params))
+                db.commit()
             db.close()
         else:
             u = DEMO_USERS[uid]
-            u["nickname"] = nick
-            u["country"] = country
-            u["state"] = state
-            u["theme"] = theme
-            u["timezone"] = tz
+            if nick is not None: u["nickname"] = nick
+            if country is not None: u["country"] = country
+            if state is not None: u["state"] = state
+            if theme is not None: u["theme"] = theme
+            if tz is not None: u["timezone"] = tz
             if avatar_name: u["avatar"] = avatar_name
             
         return redirect("/chat")
